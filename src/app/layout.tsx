@@ -40,6 +40,15 @@ export default function RootLayout({
               <Link href="/test/med" className="text-sm text-slate-700 hover:text-slate-900">
                 Test Med
               </Link>
+              <Link href="/test/med/batch" className="text-sm text-slate-700 hover:text-slate-900">
+                Test Med Batch
+              </Link>
+              <Link href="/test/med2" className="text-sm text-slate-700 hover:text-slate-900">
+                Test Med2
+              </Link>
+              <Link href="/medications/batch" className="text-sm text-slate-700 hover:text-slate-900">
+                Medications Batch
+              </Link>
             </nav>
           </div>
         </header>

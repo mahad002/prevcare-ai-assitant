@@ -39,6 +39,7 @@ export default function TestMedPage() {
     normalized: string;
     corrected: boolean;
     rationale?: string;
+    assurity?: number;
     prompt?: string;
     response?: string;
   } | null>(null);
@@ -66,6 +67,7 @@ export default function TestMedPage() {
     normalized: string;
     corrected: boolean;
     rationale?: string;
+    assurity?: number;
     prompt?: string;
     response?: string;
   } | null> => {
@@ -98,8 +100,11 @@ export default function TestMedPage() {
       const normalized = typeof result.normalized === "string" ? result.normalized : medicationName;
       const corrected = typeof result.corrected === "boolean" ? result.corrected : false;
       const rationale = typeof result.rationale === "string" ? result.rationale : undefined;
+      const assurity = typeof result.assurity === "number" && result.assurity >= 0 && result.assurity <= 100 
+        ? result.assurity 
+        : undefined;
       
-      return { original, normalized, corrected, rationale, prompt, response: responseText };
+      return { original, normalized, corrected, rationale, assurity, prompt, response: responseText };
     } catch (e) {
       console.error("Error fixing naming convention:", e);
       // Return original name if fix fails
@@ -449,6 +454,11 @@ export default function TestMedPage() {
                   <div>
                     <span className="font-medium text-green-700">Normalized:</span>{" "}
                     <span className="font-mono text-green-900">{namingConventionResult.normalized}</span>
+                    {namingConventionResult.assurity !== undefined && (
+                      <span className="ml-2 text-blue-700 font-semibold">
+                        ({namingConventionResult.assurity}% assurity)
+                      </span>
+                    )}
                   </div>
                   {namingConventionResult.rationale && (
                     <div className="text-gray-600 italic mt-1">
@@ -458,7 +468,14 @@ export default function TestMedPage() {
                 </>
               )}
               {!namingConventionResult.corrected && (
-                <div className="text-gray-600 italic">Name already follows proper convention</div>
+                <div className="text-gray-600 italic">
+                  Name already follows proper convention
+                  {namingConventionResult.assurity !== undefined && (
+                    <span className="ml-2 text-blue-700 font-semibold">
+                      ({namingConventionResult.assurity}% assurity)
+                    </span>
+                  )}
+                </div>
               )}
             </div>
             {(namingConventionResult.prompt || namingConventionResult.response) && (
