@@ -5,12 +5,12 @@ const OPENAI_KEY = process.env.NEXT_PUBLIC_OPENAI_API_KEY!;
 const GEMINI_KEY = process.env.NEXT_PUBLIC_GEMINI_API_KEY!;
 
 // =======================
-// 🤖 OpenAI (GPT-5 / 4o / 4-Turbo)
+// 🤖 OpenAI (GPT-4o / GPT-5)
 // =======================
 export async function queryOpenAI(prompt: string) {
   if (!OPENAI_KEY) throw new Error("OpenAI API key is not configured");
 
-  const models = ["gpt-5", "gpt-4o", "gpt-4-turbo"];
+  const models = ["gpt-4o", "gpt-5"];
 
   for (const model of models) {
     try {

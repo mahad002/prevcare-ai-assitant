@@ -75,6 +75,45 @@ Correction: In the previous attempt you proposed rxcui="${previousBadRxcui}" whi
   return base;
 };
 
+// Fix naming convention prompt: normalize medication name to RxNorm standard format
+export const fixNamingConventionPrompt = (medicationName: string) => {
+  const med = medicationName?.trim() || "unspecified medication";
+  return `You are a medication naming convention expert with access to RxNorm, FDA, and clinical drug naming standards.
+
+Task: Analyze the medication name "${med}" and normalize it to the standard RxNorm naming convention format.
+
+Standard RxNorm naming convention format:
+- Format: [Ingredient] [Strength] [Dosage Form] [Route]
+- Strength: Numbers with space before unit (e.g., "20 MG" not "20mg" or "20mg")
+- Units: Uppercase (MG, MCG, G, ML, etc.)
+- Dosage Form: Title Case (e.g., "Tablet", "Capsule", "Solution", "Oral Tablet")
+- Route: Title Case (e.g., "Oral", "Topical", "Injection")
+- Order: Ingredient → Strength → Dosage Form → Route
+
+Examples:
+- "amoxicillin 500mg tablet, oral" → "Amoxicillin 500 MG Oral Tablet"
+- "ibuprofen 200mg tab" → "Ibuprofen 200 MG Oral Tablet"
+- "metformin 500 MG capsule" → "Metformin 500 MG Oral Capsule"
+- "lisinopril 10mg tablet" → "Lisinopril 10 MG Oral Tablet"
+- "omeprazole 20mg capsule" → "Omeprazole 20 MG Oral Capsule"
+
+Rules:
+- Return STRICT JSON only, no explanations.
+- Keys: original (string), normalized (string), corrected (boolean), rationale (string, <= 150 chars)
+- If the name already follows proper convention, return normalized as the same (with potential minor fixes like capitalization).
+- If correction is needed, provide the normalized version following RxNorm standards.
+- Preserve all information: ingredient, strength, dosage form, route.
+- Use standard abbreviations and capitalization.
+
+Format:
+{
+  "original": "${med}",
+  "normalized": "Xyz 20 MG Oral Tablet",
+  "corrected": true,
+  "rationale": "Fixed spacing and capitalization to match RxNorm convention"
+}`;
+};
+
 // Verification prompt: compare user medication string vs RxNav properties using GPT-4o
 export const medicationVerificationPrompt = (
   inputMedication: string,

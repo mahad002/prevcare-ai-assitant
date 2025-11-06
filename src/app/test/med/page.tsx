@@ -4,18 +4,22 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getRxCui, getRxcuiProps, getRxCuiCandidates } from "../../../lib/api";
 import { callOpenAIRaw, callGemini } from "../../../lib/api";
-import { medicationInvestigationPrompt, medicationVerificationPrompt } from "../../../lib/prompts";
+import { medicationInvestigationPrompt, medicationVerificationPrompt, fixNamingConventionPrompt } from "../../../lib/prompts";
 
 type TrialResult = {
   rawText: string;
   sources: string[];
   rxcuiCandidate: string | null;
+  prompt?: string;
+  response?: string;
   verification?: {
     ok: boolean;
     name?: string;
     synonyms?: string[];
       llmVerdict?: "match" | "no_match" | "uncertain";
       llmRationale?: string;
+      verificationPrompt?: string;
+      verificationResponse?: string;
   };
 };
 
@@ -29,6 +33,15 @@ const models: Array<{ key: ModelKey; label: string; type: "openai" | "gemini" }>
 
 export default function TestMedPage() {
   const [med, setMed] = useState("");
+  const [normalizedMed, setNormalizedMed] = useState<string | null>(null);
+  const [namingConventionResult, setNamingConventionResult] = useState<{
+    original: string;
+    normalized: string;
+    corrected: boolean;
+    rationale?: string;
+    prompt?: string;
+    response?: string;
+  } | null>(null);
   const [rxcui, setRxcui] = useState<string | null>(null);
   const [rxcuiCandidates, setRxcuiCandidates] = useState<Array<{ rxcui: string; name?: string; tty?: string }>>([]);
   const [candidateProps, setCandidateProps] = useState<Record<string, Record<string, unknown> | null>>({});
@@ -46,6 +59,57 @@ export default function TestMedPage() {
   const promptFor = useCallback((name: string, previousBadRxcui?: string | null, rxnavHintRxcui?: string | null, rxnavHintList?: string[] | null) => (
     medicationInvestigationPrompt(name, previousBadRxcui, rxnavHintRxcui, rxnavHintList)
   ), []);
+
+  // Fix naming convention using GPT-4o
+  const fixNamingConvention = useCallback(async (medicationName: string): Promise<{
+    original: string;
+    normalized: string;
+    corrected: boolean;
+    rationale?: string;
+    prompt?: string;
+    response?: string;
+  } | null> => {
+    try {
+      const prompt = fixNamingConventionPrompt(medicationName);
+      const { parsed, http } = await callOpenAIRaw("gpt-4o", prompt);
+      const result = (parsed ?? {}) as Record<string, unknown>;
+      let responseText: string;
+      try {
+        if (http?.body) {
+          const fullResponse = JSON.parse(http.body);
+          const content = fullResponse?.choices?.[0]?.message?.content;
+          if (content) {
+            try {
+              responseText = JSON.stringify(JSON.parse(content), null, 2);
+            } catch {
+              responseText = content;
+            }
+          } else {
+            responseText = JSON.stringify(fullResponse, null, 2);
+          }
+        } else {
+          responseText = JSON.stringify(parsed ?? {}, null, 2);
+        }
+      } catch {
+        responseText = http?.body || JSON.stringify(parsed ?? {}, null, 2);
+      }
+      
+      const original = typeof result.original === "string" ? result.original : medicationName;
+      const normalized = typeof result.normalized === "string" ? result.normalized : medicationName;
+      const corrected = typeof result.corrected === "boolean" ? result.corrected : false;
+      const rationale = typeof result.rationale === "string" ? result.rationale : undefined;
+      
+      return { original, normalized, corrected, rationale, prompt, response: responseText };
+    } catch (e) {
+      console.error("Error fixing naming convention:", e);
+      // Return original name if fix fails
+      return {
+        original: medicationName,
+        normalized: medicationName,
+        corrected: false,
+      };
+    }
+  }, []);
 
   // Stable RxCUI verification helper placed before runOneTrial to satisfy hook deps
   const verifyRxcuiAgainstName = useCallback(async (rxcuiCandidate: string | null, inputName: string) => {
@@ -103,9 +167,31 @@ export default function TestMedPage() {
       // LLM-based verification using GPT-4o over full RxNav properties JSON
       let llmVerdict: "match" | "no_match" | "uncertain" | undefined;
       let llmRationale: string | undefined;
+      let verificationPrompt: string | undefined;
+      let verificationResponse: string | undefined;
       try {
         const vPrompt = medicationVerificationPrompt(inputName, { properties: props });
-        const { parsed } = await callOpenAIRaw("gpt-4o", vPrompt);
+        verificationPrompt = vPrompt;
+        const { parsed, http } = await callOpenAIRaw("gpt-4o", vPrompt);
+        try {
+          if (http?.body) {
+            const fullResponse = JSON.parse(http.body);
+            const content = fullResponse?.choices?.[0]?.message?.content;
+            if (content) {
+              try {
+                verificationResponse = JSON.stringify(JSON.parse(content), null, 2);
+              } catch {
+                verificationResponse = content;
+              }
+            } else {
+              verificationResponse = JSON.stringify(fullResponse, null, 2);
+            }
+          } else {
+            verificationResponse = JSON.stringify(parsed ?? {}, null, 2);
+          }
+        } catch {
+          verificationResponse = http?.body || JSON.stringify(parsed ?? {}, null, 2);
+        }
         const pv = (parsed ?? {}) as Record<string, unknown>;
         const v = (typeof pv.verdict === "string" ? pv.verdict : "") as string;
         if (v === "match" || v === "no_match" || v === "uncertain") {
@@ -116,7 +202,7 @@ export default function TestMedPage() {
       } catch {}
 
       const ok = okRule || llmVerdict === "match";
-      return { ok, name: rxName, synonyms, llmVerdict, llmRationale } as const;
+      return { ok, name: rxName, synonyms, llmVerdict, llmRationale, verificationPrompt, verificationResponse } as const;
     } catch {
       return { ok: false } as const;
     }
@@ -128,24 +214,56 @@ export default function TestMedPage() {
       if (model === "gemini") {
         const raw = await callGemini(p) as unknown;
         const rawObj = (raw ?? {}) as Record<string, unknown>;
+        const responseText = JSON.stringify(rawObj, null, 2);
         const sources: string[] = asStringArray(rawObj.sources);
         const rxcuiCandidate: string | null = asString(rawObj.rxcui);
         const verification = await verifyRxcuiAgainstName(rxcuiCandidate, name);
-        return { rawText: JSON.stringify(rawObj), sources, rxcuiCandidate, verification };
+        return { 
+          rawText: JSON.stringify(rawObj), 
+          sources, 
+          rxcuiCandidate, 
+          verification, 
+          prompt: p, 
+          response: responseText 
+        };
       } else {
         const { parsed, http } = await callOpenAIRaw(model, p);
+        let responseText: string;
+        try {
+          if (http?.body) {
+            const fullResponse = JSON.parse(http.body);
+            // Extract the actual content from the OpenAI response
+            const content = fullResponse?.choices?.[0]?.message?.content;
+            if (content) {
+              try {
+                // Try to parse and format the JSON content
+                responseText = JSON.stringify(JSON.parse(content), null, 2);
+              } catch {
+                // If not JSON, show as-is
+                responseText = content;
+              }
+            } else {
+              // Fallback to full response
+              responseText = JSON.stringify(fullResponse, null, 2);
+            }
+          } else {
+            responseText = JSON.stringify(parsed ?? {}, null, 2);
+          }
+        } catch {
+          responseText = http?.body || JSON.stringify(parsed ?? {}, null, 2);
+        }
         if (http && !http.ok) {
-          return { rawText: http.body, sources: [], rxcuiCandidate: null };
+          return { rawText: http.body, sources: [], rxcuiCandidate: null, prompt: p, response: responseText };
         }
         const obj = (parsed ?? {}) as Record<string, unknown>;
         const sources: string[] = asStringArray(obj.sources);
         const rxcuiCandidate: string | null = asString(obj.rxcui);
         const verification = await verifyRxcuiAgainstName(rxcuiCandidate, name);
-        return { rawText: JSON.stringify(parsed ?? {}), sources, rxcuiCandidate, verification };
+        return { rawText: JSON.stringify(parsed ?? {}), sources, rxcuiCandidate, verification, prompt: p, response: responseText };
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      return { rawText: msg, sources: [], rxcuiCandidate: null };
+      return { rawText: msg, sources: [], rxcuiCandidate: null, prompt: p, response: msg };
     }
   }, [promptFor, verifyRxcuiAgainstName]);
 
@@ -157,10 +275,23 @@ export default function TestMedPage() {
     setLoading(true);
     setError(null);
     setTrials({ "gpt-4o": [], "gpt-5": [], "gemini": [] });
+    setNormalizedMed(null);
+    setNamingConventionResult(null);
     try {
-      const rx = await getRxCui(name);
+      // Step 1: Fix naming convention using GPT-4o
+      const namingResult = await fixNamingConvention(name);
+      setNamingConventionResult(namingResult);
+      
+      // Use normalized name if correction was made and it's different from original, otherwise use original
+      const searchName = (namingResult?.corrected && namingResult.normalized && namingResult.normalized.trim() !== name.trim()) 
+        ? namingResult.normalized.trim() 
+        : name;
+      setNormalizedMed(searchName !== name ? searchName : null);
+      
+      // Step 2: Search using the (possibly normalized) name
+      const rx = await getRxCui(searchName);
       setRxcui(rx);
-      const cands = await getRxCuiCandidates(name, 8);
+      const cands = await getRxCuiCandidates(searchName, 8);
       setRxcuiCandidates(cands);
 
       // Run three trials per model in sequence for easier rate-limit handling
@@ -168,9 +299,10 @@ export default function TestMedPage() {
       for (const m of models) {
         let previousBad: string | null = null;
         for (let i = 0; i < 3; i++) {
+          // Use normalized name for trials if available
           const res = await runOneTrial(
             m.key,
-            name,
+            searchName,
             previousBad,
             rx,
             (rxcuiCandidates || []).map((c) => c.rxcui)
@@ -191,7 +323,7 @@ export default function TestMedPage() {
     } finally {
       setLoading(false);
     }
-  }, [med, runOneTrial]);
+  }, [med, runOneTrial, fixNamingConvention]);
 
   const domainCounts = useMemo(() => {
     const counts = new Map<string, number>();
@@ -304,6 +436,52 @@ export default function TestMedPage() {
       </section>
 
       <section className="mt-4">
+        {namingConventionResult && (
+          <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+            <div className="text-sm font-medium text-blue-900 mb-2">Naming Convention Check</div>
+            <div className="text-xs space-y-1">
+              <div>
+                <span className="font-medium text-gray-700">Original:</span>{" "}
+                <span className="font-mono text-gray-900">{namingConventionResult.original}</span>
+              </div>
+              {namingConventionResult.corrected && (
+                <>
+                  <div>
+                    <span className="font-medium text-green-700">Normalized:</span>{" "}
+                    <span className="font-mono text-green-900">{namingConventionResult.normalized}</span>
+                  </div>
+                  {namingConventionResult.rationale && (
+                    <div className="text-gray-600 italic mt-1">
+                      {namingConventionResult.rationale}
+                    </div>
+                  )}
+                </>
+              )}
+              {!namingConventionResult.corrected && (
+                <div className="text-gray-600 italic">Name already follows proper convention</div>
+              )}
+            </div>
+            {(namingConventionResult.prompt || namingConventionResult.response) && (
+              <details className="mt-2">
+                <summary className="text-[11px] text-blue-700 cursor-pointer font-medium">View Prompt & Response</summary>
+                <div className="mt-2 space-y-2">
+                  {namingConventionResult.prompt && (
+                    <div>
+                      <div className="text-[11px] font-medium text-gray-700 mb-1">Prompt:</div>
+                      <pre className="p-2 bg-white rounded text-[11px] whitespace-pre-wrap break-words border">{namingConventionResult.prompt}</pre>
+                    </div>
+                  )}
+                  {namingConventionResult.response && (
+                    <div>
+                      <div className="text-[11px] font-medium text-gray-700 mb-1">Response:</div>
+                      <pre className="p-2 bg-white rounded text-[11px] whitespace-pre-wrap break-words border">{namingConventionResult.response}</pre>
+                    </div>
+                  )}
+                </div>
+              </details>
+            )}
+          </div>
+        )}
         <div className="text-sm text-gray-700">
           <span className="font-medium">RxCUI:</span> <span className="font-mono">{rxcui ?? "—"}</span>
         </div>
@@ -377,6 +555,42 @@ export default function TestMedPage() {
                       </ul>
                     )}
                   </div>
+                  {(t.prompt || t.response) && (
+                    <details className="mt-2">
+                      <summary className="text-[11px] text-gray-600 cursor-pointer font-medium">Prompt & Response</summary>
+                      <div className="mt-2 space-y-2">
+                        {t.prompt && (
+                          <div>
+                            <div className="text-[11px] font-medium text-gray-700 mb-1">Prompt:</div>
+                            <pre className="p-2 bg-white rounded text-[11px] whitespace-pre-wrap break-words border">{t.prompt}</pre>
+                          </div>
+                        )}
+                        {t.response && (
+                          <div>
+                            <div className="text-[11px] font-medium text-gray-700 mb-1">Response:</div>
+                            <pre className="p-2 bg-white rounded text-[11px] whitespace-pre-wrap break-words border">{t.response}</pre>
+                          </div>
+                        )}
+                      </div>
+                    </details>
+                  )}
+                  {t.verification?.verificationPrompt && (
+                    <details className="mt-2">
+                      <summary className="text-[11px] text-gray-600 cursor-pointer font-medium">Verification Prompt & Response</summary>
+                      <div className="mt-2 space-y-2">
+                        <div>
+                          <div className="text-[11px] font-medium text-gray-700 mb-1">Verification Prompt:</div>
+                          <pre className="p-2 bg-white rounded text-[11px] whitespace-pre-wrap break-words border">{t.verification.verificationPrompt}</pre>
+                        </div>
+                        {t.verification.verificationResponse && (
+                          <div>
+                            <div className="text-[11px] font-medium text-gray-700 mb-1">Verification Response:</div>
+                            <pre className="p-2 bg-white rounded text-[11px] whitespace-pre-wrap break-words border">{t.verification.verificationResponse}</pre>
+                          </div>
+                        )}
+                      </div>
+                    </details>
+                  )}
                   <details className="mt-2">
                     <summary className="text-[11px] text-gray-600 cursor-pointer">Raw</summary>
                     <pre className="mt-1 p-2 bg-white rounded text-[11px] whitespace-pre-wrap break-words">{t.rawText}</pre>

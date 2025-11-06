@@ -1,8 +1,7 @@
 import { useState } from "react";
 import { Medication } from "../types/models";
 import { medicationPrompt } from "../lib/prompts";
-import { queryGemini, getRxCui, validateRxCui, getNDCs, getFDAInfo } from "../lib/api";
-// Note: queryGemini function name is kept for backward compatibility, but it now uses OpenAI
+import { queryOpenAI, getRxCui, validateRxCui, getNDCs, getFDAInfo } from "../lib/api";
 
 export function useMedicationAssistant() {
   const [loading, setLoading] = useState(false);
@@ -15,8 +14,8 @@ export function useMedicationAssistant() {
     setLoading(true);
     setError(null);
     try {
-      // Step 1: Get clinical recommendations from GPT (clinical reasoning)
-      const ai = await queryGemini(medicationPrompt(condition));
+      // Step 1: Get clinical recommendations from GPT-4o or GPT-5 (clinical reasoning)
+      const ai = await queryOpenAI(medicationPrompt(condition));
       const meds = ai.recommended_drugs || [];
       
       if (meds.length === 0) {
