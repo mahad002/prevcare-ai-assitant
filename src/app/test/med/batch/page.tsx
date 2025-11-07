@@ -6,6 +6,7 @@ import { callOpenAIRaw } from "../../../../lib/api";
 import { fixNamingConventionPrompt } from "../../../../lib/prompts";
 import { loadMedicationsList } from "../../../../lib/medicationsLoader";
 import { resolveMedication, type Resolution } from "../../../../lib/rxcuiResolution";
+import { type RxCuiLookupResult } from "../../../../lib/rxcuiEnhanced";
 
 type MedicationTestResult = {
   originalName: string;
