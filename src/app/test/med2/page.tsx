@@ -138,6 +138,7 @@ export default function TestMed2Page() {
   const [llmComparison, setLlmComparison] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   const [dailyMedData, setDailyMedData] = useState<Record<string, any>>({}); // Store DailyMed raw data by RxCUI
+  const [fdaSplData, setFdaSplData] = useState<Record<string, any>>({}); // Store FDA SPL Set ID search data by RxCUI
 
   // Step 1: LLM Normalization
   const step1Normalize = useCallback(async (input: string): Promise<NormalizedData> => {
@@ -363,7 +364,7 @@ export default function TestMed2Page() {
   }, []);
 
   // Step 4: Fetch and verify NDCs (SPL_SET_ID → DailyMed → openFDA → RxNorm chain)
-  const step4FetchNDCs = useCallback(async (rxcui: string): Promise<{ ndcs: NDCInfo[]; dailyMedRaw?: any }> => {
+  const step4FetchNDCs = useCallback(async (rxcui: string): Promise<{ ndcs: NDCInfo[]; dailyMedRaw?: any; fdaSplRaw?: any }> => {
     setStep("Step 4: Fetching and verifying NDCs using SPL_SET_ID from DailyMed, openFDA, and RxNorm...");
     const ndcMap = new Map<string, { info: any; source: string; spl_set_id?: string }>(); // Track NDC with source priority and SPL_SET_ID
     const results: NDCInfo[] = [];
@@ -374,14 +375,17 @@ export default function TestMed2Page() {
       const propsRes = await fetch(`https://rxnav.nlm.nih.gov/REST/rxcui/${rxcui}/properties.json`);
       if (propsRes.ok) {
         const propsJson = await propsRes.json();
+        console.log("RxNorm properties JSON for RxCUI", rxcui, ":", JSON.stringify(propsJson, null, 2));
         const properties = propsJson?.properties || {};
         
         // Check for SPL_SET_ID in properties
         // RxNorm may return it as a property with propName="SPL_SET_ID"
         if (properties.SPL_SET_ID) {
           splSetId = properties.SPL_SET_ID;
+          console.log("Found SPL_SET_ID from properties.SPL_SET_ID:", splSetId);
         } else if (propsJson?.properties?.propName === "SPL_SET_ID") {
           splSetId = propsJson.properties.propValue;
+          console.log("Found SPL_SET_ID from properties.propValue:", splSetId);
         }
         
         // If properties has a properties array, search for SPL_SET_ID
@@ -391,6 +395,21 @@ export default function TestMed2Page() {
           );
           if (splProp) {
             splSetId = splProp.propValue || splProp.prop_value;
+            console.log("Found SPL_SET_ID from properties array:", splSetId);
+          }
+        }
+        
+        // Check property array structure (RxNorm format)
+        if (!splSetId && propsJson?.properties?.property) {
+          const props = Array.isArray(propsJson.properties.property) 
+            ? propsJson.properties.property 
+            : [propsJson.properties.property];
+          for (const prop of props) {
+            if (prop.propName === "SPL_SET_ID" && prop.propValue) {
+              splSetId = prop.propValue;
+              console.log("Found SPL_SET_ID from property array:", splSetId);
+              break;
+            }
           }
         }
         
@@ -399,12 +418,16 @@ export default function TestMed2Page() {
           const tty = properties.tty;
           if (tty === "SBD" && properties.spl_set_id) {
             splSetId = properties.spl_set_id;
+            console.log("Found SPL_SET_ID from SBD TTY:", splSetId);
           }
         }
+      } else {
+        console.warn("Failed to fetch RxNorm properties. Status:", propsRes.status);
       }
       
       // Fallback: Try to get from openFDA search if not found in properties
       if (!splSetId) {
+        console.log("SPL_SET_ID not found in RxNorm, trying openFDA fallback...");
         try {
           const fdaSearchRes = await fetch(`https://api.fda.gov/drug/ndc.json?search=openfda.rxcui:"${rxcui}"&limit=1`);
           if (fdaSearchRes.ok) {
@@ -414,6 +437,7 @@ export default function TestMed2Page() {
               splSetId = Array.isArray(firstResult.openfda.spl_set_id) 
                 ? firstResult.openfda.spl_set_id[0] 
                 : firstResult.openfda.spl_set_id;
+              console.log("Found SPL_SET_ID from openFDA fallback:", splSetId);
             }
           }
         } catch (e) {
@@ -421,8 +445,10 @@ export default function TestMed2Page() {
         }
       }
     } catch (e) {
-      console.warn("Error fetching properties for SPL Set ID:", e);
+      console.error("Error fetching properties for SPL Set ID:", e);
     }
+    
+    console.log("Final SPL_SET_ID for RxCUI", rxcui, ":", splSetId);
 
     // 4.2 Verified NDC Retrieval Chain
     
@@ -430,9 +456,15 @@ export default function TestMed2Page() {
     let dailyMedRawData: any = null;
     if (splSetId) {
       try {
-        const dailyMedRes = await fetch(`https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/${splSetId}/packaging.json`);
+        // Use Next.js API route to proxy the request (avoids CORS issues)
+        const dailyMedUrl = `/api/dailymed?spl_set_id=${encodeURIComponent(splSetId)}`;
+        console.log("Fetching DailyMed via proxy:", dailyMedUrl);
+        const dailyMedRes = await fetch(dailyMedUrl);
+        console.log("DailyMed response status:", dailyMedRes.status, dailyMedRes.statusText);
+        
         if (dailyMedRes.ok) {
           const dailyMedJson = await dailyMedRes.json();
+          console.log("DailyMed JSON received:", dailyMedJson);
           dailyMedRawData = dailyMedJson; // Store raw data for display
           
           // Parse the actual DailyMed structure
@@ -484,18 +516,27 @@ export default function TestMed2Page() {
               }
             }
           }
+        } else {
+          const errorText = await dailyMedRes.text();
+          console.error("DailyMed fetch failed:", dailyMedRes.status, errorText);
         }
       } catch (e) {
-        console.warn("Error fetching DailyMed NDCs:", e);
+        console.error("Error fetching DailyMed NDCs:", e);
+        console.error("Error details:", e instanceof Error ? e.message : String(e));
+        console.error("Stack:", e instanceof Error ? e.stack : "N/A");
       }
+    } else {
+      console.warn("No SPL Set ID found for RxCUI:", rxcui);
     }
 
     // Step 2: openFDA (SPL_SET_ID search) - validate/supplement DailyMed
+    let fdaSplRawData: any = null;
     if (splSetId) {
       try {
         const fdaRes = await fetch(`https://api.fda.gov/drug/ndc.json?search=openfda.spl_set_id="${splSetId}"&limit=200`);
         if (fdaRes.ok) {
           const fdaJson = await fdaRes.json();
+          fdaSplRawData = fdaJson; // Store raw FDA data for display
           const fdaResults = fdaJson?.results || [];
           
           for (const r of fdaResults) {
@@ -739,6 +780,7 @@ export default function TestMed2Page() {
     return {
       ndcs: results,
       dailyMedRaw: dailyMedRawData || undefined,
+      fdaSplRaw: fdaSplRawData || undefined,
     };
   }, []);
 
@@ -919,19 +961,28 @@ export default function TestMed2Page() {
       }
       
       // Fetch NDCs for SCD if not already fetched
-      let scdNDCs = ndcs[scdRxCui] || [];
-      if (scdNDCs.length === 0) {
-        // Fetch NDCs for SCD
-        const scdResult = await step4FetchNDCs(scdRxCui);
-        scdNDCs = scdResult.ndcs;
-        // Store DailyMed raw data if available
-        if (scdResult.dailyMedRaw && setDailyMedDataFn) {
-          setDailyMedDataFn(prev => ({
-            ...prev,
-            [scdRxCui]: scdResult.dailyMedRaw,
-          }));
-        }
-      }
+      // COMMENTED OUT: SCD NDC fetching disabled - only keeping SBD NDC searches
+      // let scdNDCs = ndcs[scdRxCui] || [];
+      // if (scdNDCs.length === 0) {
+      //   // Fetch NDCs for SCD
+      //   const scdResult = await step4FetchNDCs(scdRxCui);
+      //   scdNDCs = scdResult.ndcs;
+      //   // Store DailyMed and FDA raw data if available
+      //   if (scdResult.dailyMedRaw && setDailyMedDataFn) {
+      //     setDailyMedDataFn(prev => ({
+      //       ...prev,
+      //       [scdRxCui]: scdResult.dailyMedRaw,
+      //     }));
+      //   }
+      //   if (scdResult.fdaSplRaw) {
+      //     setFdaSplData(prev => ({
+      //       ...prev,
+      //       [scdRxCui]: scdResult.fdaSplRaw,
+      //     }));
+      //   }
+      // }
+      // Use empty array for SCD NDCs (NDC fetching disabled)
+      const scdNDCs: NDCInfo[] = [];
       scdComponent = await processRxCuiToComponent(
         scdRxCui,
         input,
@@ -964,11 +1015,17 @@ export default function TestMed2Page() {
         // Fetch NDCs for SBD (this will use DailyMed → openFDA → RxNorm chain)
         const sbdResult = await step4FetchNDCs(sbdRxCui);
         sbdNDCs = sbdResult.ndcs;
-        // Store DailyMed raw data if available
+        // Store DailyMed and FDA raw data if available
         if (sbdResult.dailyMedRaw && setDailyMedDataFn) {
           setDailyMedDataFn(prev => ({
             ...prev,
             [sbdRxCui]: sbdResult.dailyMedRaw,
+          }));
+        }
+        if (sbdResult.fdaSplRaw) {
+          setFdaSplData(prev => ({
+            ...prev,
+            [sbdRxCui]: sbdResult.fdaSplRaw,
           }));
         }
       }
@@ -1051,6 +1108,7 @@ export default function TestMed2Page() {
     setFinalResult(null);
     setLlmComparison(null);
     setDailyMedData({});
+    setFdaSplData({});
 
     try {
       // Step 1: Normalize
@@ -1080,11 +1138,17 @@ export default function TestMed2Page() {
         const result = await step4FetchNDCs(topCandidate.candidate.rxcui);
         ndcData[topCandidate.candidate.rxcui] = result.ndcs;
         setNdcResults(ndcData);
-        // Store DailyMed raw data if available
+        // Store DailyMed and FDA raw data if available
         if (result.dailyMedRaw) {
           setDailyMedData(prev => ({
             ...prev,
             [topCandidate.candidate.rxcui]: result.dailyMedRaw,
+          }));
+        }
+        if (result.fdaSplRaw) {
+          setFdaSplData(prev => ({
+            ...prev,
+            [topCandidate.candidate.rxcui]: result.fdaSplRaw,
           }));
         }
       }
@@ -1238,91 +1302,186 @@ export default function TestMed2Page() {
         </section>
       )}
 
-      {/* DailyMed Raw Data Section */}
-      {Object.keys(dailyMedData).length > 0 && (
-        <section className="mt-6 bg-purple-50 border-2 border-purple-300 rounded-xl shadow-sm p-4">
-          <h2 className="text-sm font-semibold text-purple-900 mb-3">
-            📋 DailyMed Packaging Data (Raw API Response)
+      {/* DailyMed vs FDA Comparison Section */}
+      {(Object.keys(dailyMedData).length > 0 || Object.keys(fdaSplData).length > 0) && (
+        <section className="mt-6 bg-gradient-to-r from-purple-50 to-blue-50 border-2 border-purple-300 rounded-xl shadow-sm p-4">
+          <h2 className="text-sm font-semibold text-gray-900 mb-3">
+            📊 DailyMed vs FDA Comparison (SPL Set ID Search)
           </h2>
-          {Object.entries(dailyMedData).map(([rxcui, data]) => {
-            const splSetId = data?.data?.setid || "N/A";
-            const apiUrl = splSetId !== "N/A" 
+          
+          {/* Get all unique RxCUIs from both sources */}
+          {Array.from(new Set([...Object.keys(dailyMedData), ...Object.keys(fdaSplData)])).map((rxcui) => {
+            const dailyMed = dailyMedData[rxcui];
+            const fda = fdaSplData[rxcui];
+            const splSetId = dailyMed?.data?.setid || fda?.results?.[0]?.openfda?.spl_set_id?.[0] || "N/A";
+            
+            const dailyMedUrl = splSetId !== "N/A" 
               ? `https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/${splSetId}/packaging.json`
               : null;
+            const fdaUrl = splSetId !== "N/A"
+              ? `https://api.fda.gov/drug/ndc.json?search=openfda.spl_set_id="${splSetId}"`
+              : null;
+            
             return (
-            <div key={rxcui} className="mb-4 last:mb-0">
-              <div className="text-xs text-gray-600 mb-2">
-                RxCUI: <span className="font-mono">{rxcui}</span>
-                {apiUrl && (
-                  <span className="ml-2">
-                    | Source: <a href={apiUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline font-mono text-[10px]">DailyMed API</a>
-                  </span>
-                )}
-              </div>
-              {data && (
-                <div className="space-y-3">
-                  {/* Metadata */}
-                  {data.metadata && (
-                    <div className="bg-white rounded-lg p-3 border border-purple-200">
-                      <div className="text-xs font-semibold text-purple-900 mb-2">Metadata</div>
-                      <div className="space-y-1 text-[11px]">
-                        <div><span className="font-medium">Published Date:</span> {data.metadata.db_published_date || "N/A"}</div>
-                        <div><span className="font-medium">Current URL:</span> <a href={data.metadata.current_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline break-all text-[10px]">{data.metadata.current_url}</a></div>
-                      </div>
-                    </div>
+              <div key={rxcui} className="mb-6 last:mb-0">
+                <div className="text-xs text-gray-600 mb-3">
+                  RxCUI: <span className="font-mono">{rxcui}</span>
+                  {splSetId !== "N/A" && (
+                    <span className="ml-2">| SPL Set ID: <span className="font-mono text-[10px]">{splSetId}</span></span>
                   )}
-                  
-                  {/* Main Data */}
-                  {data.data && (
-                    <div className="bg-white rounded-lg p-3 border border-purple-200">
-                      <div className="text-xs font-semibold text-purple-900 mb-2">Product Information</div>
+                </div>
+                
+                {/* Side-by-side comparison */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* DailyMed Column */}
+                  <div className="bg-purple-50 border-2 border-purple-300 rounded-lg p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <h3 className="text-xs font-semibold text-purple-900">📋 DailyMed</h3>
+                      {dailyMedUrl && (
+                        <a href={dailyMedUrl} target="_blank" rel="noopener noreferrer" className="text-[9px] text-blue-600 hover:underline">View API</a>
+                      )}
+                    </div>
+                    {dailyMed ? (
                       <div className="space-y-2 text-[11px]">
-                        <div><span className="font-medium">Title:</span> {data.data.title || "N/A"}</div>
-                        <div><span className="font-medium">SPL Set ID:</span> <span className="font-mono text-[10px]">{data.data.setid || "N/A"}</span></div>
-                        <div><span className="font-medium">SPL Version:</span> {data.data.spl_version || "N/A"}</div>
-                        <div><span className="font-medium">Published Date:</span> {data.data.published_date || "N/A"}</div>
-                        
-                        {/* Products */}
-                        {data.data.products && data.data.products.length > 0 && (
-                          <div className="mt-3">
-                            <div className="text-xs font-semibold text-purple-800 mb-2">Products ({data.data.products.length}):</div>
-                            <div className="space-y-3">
-                              {data.data.products.map((product: any, idx: number) => (
-                                <div key={idx} className="bg-purple-50 rounded p-2 border border-purple-200">
-                                  <div className="font-semibold text-[11px] text-purple-900 mb-1">
-                                    Product #{idx + 1}: {product.product_name || "N/A"}
+                        {dailyMed.metadata && (
+                          <div className="bg-white rounded p-2 border border-purple-200">
+                            <div className="font-medium text-purple-800 mb-1">Metadata</div>
+                            <div className="text-[10px] text-gray-600">
+                              <div>Published: {dailyMed.metadata.db_published_date || "N/A"}</div>
+                            </div>
+                          </div>
+                        )}
+                        {dailyMed.data && (
+                          <div className="bg-white rounded p-2 border border-purple-200">
+                            <div className="font-medium text-purple-800 mb-1">Product Info</div>
+                            <div className="text-[10px] space-y-1">
+                              <div><span className="font-medium">Title:</span> {dailyMed.data.title || "N/A"}</div>
+                              <div><span className="font-medium">Version:</span> {dailyMed.data.spl_version || "N/A"}</div>
+                              <div><span className="font-medium">Published:</span> {dailyMed.data.published_date || "N/A"}</div>
+                            </div>
+                            
+                            {/* Products */}
+                            {dailyMed.data.products && dailyMed.data.products.length > 0 && (
+                              <div className="mt-2">
+                                <div className="font-medium text-purple-800 mb-1">Products ({dailyMed.data.products.length}):</div>
+                                <div className="space-y-2 max-h-96 overflow-y-auto">
+                                  {dailyMed.data.products.map((product: any, idx: number) => {
+                                    // Check if this is SCD (generic) - product_name equals product_name_generic
+                                    const isSCD = product.product_name && product.product_name_generic && 
+                                                product.product_name.toLowerCase() === product.product_name_generic.toLowerCase();
+                                    return (
+                                    <div key={idx} className="bg-purple-100 rounded p-2 border border-purple-200">
+                                      <div className="font-semibold text-[10px] text-purple-900 mb-1">
+                                        <span className="font-bold">{isSCD ? "Name:" : "Brand:"}</span> {product.product_name || "N/A"} <span className="text-gray-600">({product.product_code || "N/A"})</span>
+                                      </div>
+                                      <div className="text-[9px] text-gray-700 space-y-0.5">
+                                        <div><span className="font-medium">Generic:</span> {product.product_name_generic || "N/A"}</div>
+                                        <div><span className="font-medium">Brand Name:</span> {product.product_name || "N/A"}</div>
+                                        {product.active_ingredients && product.active_ingredients.length > 0 && (
+                                          <div>
+                                            <span className="font-medium">Ingredients:</span>
+                                            <ul className="list-disc list-inside ml-1 mt-0.5">
+                                              {product.active_ingredients.map((ai: any, aiIdx: number) => (
+                                                <li key={aiIdx}>{ai.strength || ""} {ai.name || ""}</li>
+                                              ))}
+                                            </ul>
+                                          </div>
+                                        )}
+                                        {product.packaging && product.packaging.length > 0 && (
+                                          <div>
+                                            <span className="font-medium">NDCs ({product.packaging.length}):</span>
+                                            <div className="ml-1 mt-0.5 space-y-0.5">
+                                              {product.packaging.map((pkg: any, pkgIdx: number) => (
+                                                <div key={pkgIdx} className="font-mono text-purple-900">
+                                                  {pkg.ndc || "N/A"}
+                                                  {pkg.package_descriptions && pkg.package_descriptions.length > 0 && (
+                                                    <span className="text-gray-600 ml-1">
+                                                      ({pkg.package_descriptions.join(", ")})
+                                                    </span>
+                                                  )}
+                                                </div>
+                                              ))}
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-[11px] text-gray-500">No DailyMed data available</div>
+                    )}
+                  </div>
+                  
+                  {/* FDA Column */}
+                  <div className="bg-blue-50 border-2 border-blue-300 rounded-lg p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <h3 className="text-xs font-semibold text-blue-900">🏥 openFDA</h3>
+                      {fdaUrl && (
+                        <a href={fdaUrl} target="_blank" rel="noopener noreferrer" className="text-[9px] text-blue-600 hover:underline">View API</a>
+                      )}
+                    </div>
+                    {fda ? (
+                      <div className="space-y-2 text-[11px]">
+                        {fda.meta && (
+                          <div className="bg-white rounded p-2 border border-blue-200">
+                            <div className="font-medium text-blue-800 mb-1">Metadata</div>
+                            <div className="text-[10px] text-gray-600">
+                              <div>Total Results: {fda.meta.results?.total || 0}</div>
+                              <div>Last Updated: {fda.meta.last_updated || "N/A"}</div>
+                            </div>
+                          </div>
+                        )}
+                        {fda.results && fda.results.length > 0 ? (
+                          <div className="bg-white rounded p-2 border border-blue-200">
+                            <div className="font-medium text-blue-800 mb-1">Products ({fda.results.length}):</div>
+                            <div className="space-y-2 max-h-96 overflow-y-auto">
+                              {fda.results.map((result: any, idx: number) => {
+                                // Check if this is SCD (generic) - brand_name equals generic_name
+                                const isSCD = result.brand_name && result.generic_name && 
+                                            result.brand_name.toLowerCase() === result.generic_name.toLowerCase();
+                                return (
+                                <div key={idx} className="bg-blue-100 rounded p-2 border border-blue-200">
+                                  <div className="font-semibold text-[10px] text-blue-900 mb-1">
+                                    <span className="font-bold">{isSCD ? "Name:" : "Brand:"}</span> {result.brand_name || "N/A"} <span className="text-gray-600">({result.product_ndc || "N/A"})</span>
                                   </div>
-                                  <div className="space-y-1 text-[10px] text-gray-700">
-                                    <div><span className="font-medium">Generic Name:</span> {product.product_name_generic || "N/A"}</div>
-                                    <div><span className="font-medium">Product Code:</span> <span className="font-mono">{product.product_code || "N/A"}</span></div>
-                                    
-                                    {/* Active Ingredients */}
-                                    {product.active_ingredients && product.active_ingredients.length > 0 && (
-                                      <div className="mt-1">
-                                        <span className="font-medium">Active Ingredients:</span>
-                                        <ul className="list-disc list-inside ml-2 mt-0.5">
-                                          {product.active_ingredients.map((ai: any, aiIdx: number) => (
-                                            <li key={aiIdx}>
-                                              {ai.strength || ""} {ai.name || ""}
-                                            </li>
+                                  <div className="text-[9px] text-gray-700 space-y-0.5">
+                                    <div><span className="font-medium">Generic:</span> {result.generic_name || "N/A"}</div>
+                                    <div><span className="font-medium">Brand Name:</span> {result.brand_name || "N/A"}</div>
+                                    <div><span className="font-medium">Labeler:</span> {result.labeler_name || "N/A"}</div>
+                                    <div><span className="font-medium">Type:</span> {result.product_type || "N/A"}</div>
+                                    <div><span className="font-medium">Form:</span> {result.dosage_form || "N/A"}</div>
+                                    <div><span className="font-medium">Route:</span> {Array.isArray(result.route) ? result.route.join(", ") : result.route || "N/A"}</div>
+                                    {result.active_ingredients && result.active_ingredients.length > 0 && (
+                                      <div>
+                                        <span className="font-medium">Ingredients:</span>
+                                        <ul className="list-disc list-inside ml-1 mt-0.5">
+                                          {result.active_ingredients.map((ai: any, aiIdx: number) => (
+                                            <li key={aiIdx}>{ai.strength || ""} {ai.name || ""}</li>
                                           ))}
                                         </ul>
                                       </div>
                                     )}
-                                    
-                                    {/* Packaging */}
-                                    {product.packaging && product.packaging.length > 0 && (
-                                      <div className="mt-1">
-                                        <span className="font-medium">Packaging ({product.packaging.length}):</span>
-                                        <div className="ml-2 mt-0.5 space-y-1">
-                                          {product.packaging.map((pkg: any, pkgIdx: number) => (
-                                            <div key={pkgIdx} className="bg-white rounded p-1 border border-purple-100">
-                                              <div className="font-mono font-semibold text-purple-900">NDC: {pkg.ndc || "N/A"}</div>
-                                              {pkg.package_descriptions && pkg.package_descriptions.length > 0 && (
-                                                <div className="text-gray-600 mt-0.5">
-                                                  {pkg.package_descriptions.map((desc: string, descIdx: number) => (
-                                                    <div key={descIdx} className="text-[10px]">{desc}</div>
-                                                  ))}
+                                    {result.packaging && result.packaging.length > 0 && (
+                                      <div>
+                                        <span className="font-medium">NDCs ({result.packaging.length}):</span>
+                                        <div className="ml-1 mt-0.5 space-y-0.5">
+                                          {result.packaging.map((pkg: any, pkgIdx: number) => (
+                                            <div key={pkgIdx} className="font-mono text-blue-900">
+                                              {pkg.package_ndc || "N/A"}
+                                              {pkg.description && (
+                                                <span className="text-gray-600 ml-1">({pkg.description})</span>
+                                              )}
+                                              {pkg.marketing_start_date && (
+                                                <div className="text-[8px] text-gray-500 ml-1">
+                                                  Start: {pkg.marketing_start_date}
+                                                  {pkg.marketing_end_date && ` | End: ${pkg.marketing_end_date}`}
                                                 </div>
                                               )}
                                             </div>
@@ -1330,18 +1489,59 @@ export default function TestMed2Page() {
                                         </div>
                                       </div>
                                     )}
+                                    {result.marketing_start_date && (
+                                      <div className="text-[9px] text-gray-600">
+                                        <span className="font-medium">Marketing:</span> {result.marketing_start_date}
+                                        {result.marketing_end_date && ` - ${result.marketing_end_date}`}
+                                      </div>
+                                    )}
+                                    {result.application_number && (
+                                      <div className="text-[9px] text-gray-600">
+                                        <span className="font-medium">App #:</span> {result.application_number}
+                                      </div>
+                                    )}
+                                    {result.openfda?.rxcui && (
+                                      <div className="text-[9px] text-gray-600">
+                                        <span className="font-medium">RxCUIs:</span> {Array.isArray(result.openfda.rxcui) ? result.openfda.rxcui.join(", ") : result.openfda.rxcui}
+                                      </div>
+                                    )}
                                   </div>
                                 </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           </div>
+                        ) : (
+                          <div className="text-[11px] text-gray-500">No FDA results found</div>
                         )}
                       </div>
-                    </div>
-                  )}
+                    ) : (
+                      <div className="text-[11px] text-gray-500">No FDA data available</div>
+                    )}
+                  </div>
                 </div>
-              )}
-            </div>
+                
+                {/* Comparison Summary */}
+                {dailyMed && fda && (
+                  <div className="mt-3 bg-yellow-50 border border-yellow-200 rounded p-2">
+                    <div className="text-xs font-semibold text-yellow-900 mb-1">📊 Comparison Summary</div>
+                    <div className="text-[10px] text-gray-700 space-y-0.5">
+                      <div>
+                        <span className="font-medium">DailyMed Products:</span> {dailyMed.data?.products?.length || 0} | 
+                        <span className="font-medium ml-2">FDA Products:</span> {fda.results?.length || 0}
+                      </div>
+                      <div>
+                        <span className="font-medium">DailyMed Total NDCs:</span> {
+                          dailyMed.data?.products?.reduce((sum: number, p: any) => sum + (p.packaging?.length || 0), 0) || 0
+                        } | 
+                        <span className="font-medium ml-2">FDA Total NDCs:</span> {
+                          fda.results?.reduce((sum: number, r: any) => sum + (r.packaging?.length || 0), 0) || 0
+                        }
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
             );
           })}
         </section>
