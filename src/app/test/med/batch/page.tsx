@@ -20,10 +20,11 @@ type MedicationTestResult = {
   } | null;
   rxcui: string | null; // Most specific RxCUI
   groupRxCui: string | null; // Ingredient-level RxCUI (group)
-  rxcuiApiResponse: any; // Raw API response from RxNav
+  rxcuiApiResponse: unknown; // Raw API response from RxNav
   rxcuiResolution: Resolution | null; // New resolution result
+  rxcuiLookupResult: RxCuiLookupResult | null; // Enhanced lookup result
   rxcuiCandidates: Array<{ rxcui: string; name?: string; tty?: string; source?: string; score?: number }>;
-  rxcuiCandidatesApiResponse: any; // Raw API response for candidates
+  rxcuiCandidatesApiResponse: unknown; // Raw API response for candidates
   error?: string;
   status: "pending" | "processing" | "completed" | "error";
 };
@@ -37,10 +38,11 @@ export default function BatchTestMedPage() {
   const [autoRun, setAutoRun] = useState(false);
   const [delay, setDelay] = useState(1000); // Delay between tests in ms
   const [selectedApiResponse, setSelectedApiResponse] = useState<{
-    rxcui?: any;
-    candidates?: any;
+    rxcui?: unknown;
+    candidates?: unknown;
     candidateType?: 'processed' | 'lookup';
     lookupResult?: RxCuiLookupResult | null;
+    resolution?: Resolution | null;
   } | null>(null);
 
   // Load medications list on mount
@@ -63,6 +65,7 @@ export default function BatchTestMedPage() {
           groupRxCui: null,
           rxcuiApiResponse: null,
           rxcuiResolution: null,
+          rxcuiLookupResult: null,
           rxcuiCandidates: [],
           rxcuiCandidatesApiResponse: null,
           status: "pending",
@@ -121,7 +124,9 @@ export default function BatchTestMedPage() {
           normalizedName: null,
           namingResult: null,
           rxcui: null,
+          groupRxCui: null,
           rxcuiApiResponse: null,
+          rxcuiResolution: null,
           rxcuiLookupResult: null,
           rxcuiCandidates: [],
           rxcuiCandidatesApiResponse: null,
@@ -144,10 +149,10 @@ export default function BatchTestMedPage() {
       // Step 2: Search RxCUI with new resolution flow
       let rxcui: string | null = null;
       let groupRxCui: string | null = null;
-      let rxcuiApiResponse: any = null;
+      let rxcuiApiResponse: unknown = null;
       let rxcuiResolution: Resolution | null = null;
       let rxcuiCandidates: Array<{ rxcui: string; name?: string; tty?: string; source?: string; score?: number }> = [];
-      let rxcuiCandidatesApiResponse: any = null;
+      let rxcuiCandidatesApiResponse: unknown = null;
 
       try {
         // Use new resolution flow
@@ -199,6 +204,7 @@ export default function BatchTestMedPage() {
           groupRxCui: groupRxCui,
           rxcuiApiResponse,
           rxcuiResolution,
+          rxcuiLookupResult: null,
           rxcuiCandidates,
           rxcuiCandidatesApiResponse,
           status: "completed",
@@ -214,8 +220,10 @@ export default function BatchTestMedPage() {
             normalizedName: null,
             namingResult: null,
             rxcui: null,
+            groupRxCui: null,
             rxcuiApiResponse: null,
             rxcuiResolution: null,
+            rxcuiLookupResult: null,
             rxcuiCandidates: [],
             rxcuiCandidatesApiResponse: null,
             status: "pending",
@@ -520,16 +528,22 @@ export default function BatchTestMedPage() {
                           onClick={() => {
                             const candidates = result.rxcuiLookupResult!.attempts
                               .flatMap(a => {
-                                const cands = a.apiResponse?.approximateGroup?.candidate || [];
-                                return cands.map((c: any) => ({
+                                const cands = (a.apiResponse?.approximateGroup?.candidate || []) as Array<{
+                                  rxcui?: unknown;
+                                  name?: unknown;
+                                  source?: unknown;
+                                  score?: unknown;
+                                  rank?: unknown;
+                                }>;
+                                return cands.map((c) => ({
                                   rxcui: String(c.rxcui || ''),
-                                  name: c.name || '',
-                                  source: c.source || '',
-                                  score: c.score || 0,
-                                  rank: c.rank || '',
+                                  name: String(c.name || ''),
+                                  source: String(c.source || ''),
+                                  score: typeof c.score === 'number' ? c.score : 0,
+                                  rank: String(c.rank || ''),
                                 }));
                               })
-                              .filter((c: any) => c.rxcui);
+                              .filter((c) => c.rxcui);
                             setSelectedApiResponse({
                               candidates,
                               candidateType: 'lookup',
@@ -598,7 +612,7 @@ export default function BatchTestMedPage() {
                   ✕
                 </button>
               </div>
-              {selectedApiResponse.rxcui && (
+              {selectedApiResponse.rxcui != null && (
                 <div>
                   <div className="font-medium mb-1 text-gray-700">RxCUI API Response:</div>
                   <pre className="text-[10px] whitespace-pre-wrap break-words bg-gray-50 p-3 rounded border overflow-auto max-h-64">
@@ -606,7 +620,7 @@ export default function BatchTestMedPage() {
                   </pre>
                 </div>
               )}
-              {selectedApiResponse.candidates && (
+              {selectedApiResponse.candidates != null && (
                 <div>
                   <div className="font-medium mb-2 text-gray-700">
                     {selectedApiResponse.candidateType === 'processed' ? 'Candidates List' : 'Candidates from Lookup'}:
@@ -614,19 +628,25 @@ export default function BatchTestMedPage() {
                   <div className="bg-gray-50 p-3 rounded border overflow-auto max-h-96">
                     <div className="text-[10px] space-y-2">
                       {Array.isArray(selectedApiResponse.candidates) ? (
-                        selectedApiResponse.candidates.map((candidate: any, cIdx: number) => (
+                        (selectedApiResponse.candidates as Array<{
+                          rxcui?: unknown;
+                          name?: unknown;
+                          tty?: unknown;
+                          source?: unknown;
+                          score?: unknown;
+                        }>).map((candidate, cIdx: number) => (
                           <div key={cIdx} className="border-b border-gray-200 pb-2 last:border-b-0">
-                            <div className="font-mono text-blue-700 font-semibold">{candidate.rxcui}</div>
-                            {candidate.name && (
-                              <div className="text-gray-700 text-[9px] mt-1">{candidate.name}</div>
+                            <div className="font-mono text-blue-700 font-semibold">{String(candidate.rxcui ?? '')}</div>
+                            {candidate.name != null && (
+                              <div className="text-gray-700 text-[9px] mt-1">{String(candidate.name)}</div>
                             )}
                             <div className="flex gap-3 mt-1 flex-wrap">
-                              {candidate.tty && (
-                                <div className="text-gray-600 text-[9px]">TTY: {candidate.tty}</div>
+                              {candidate.tty != null && (
+                                <div className="text-gray-600 text-[9px]">TTY: {String(candidate.tty)}</div>
                               )}
-                              {candidate.source && (
-                                <div className={`text-[9px] ${candidate.source === 'RXNORM' ? 'text-green-700 font-semibold' : 'text-gray-600'}`}>
-                                  Source: {candidate.source}
+                              {candidate.source != null && (
+                                <div className={`text-[9px] ${String(candidate.source) === 'RXNORM' ? 'text-green-700 font-semibold' : 'text-gray-600'}`}>
+                                  Source: {String(candidate.source)}
                                 </div>
                               )}
                               {candidate.score !== undefined && (
@@ -672,7 +692,7 @@ export default function BatchTestMedPage() {
                       <div className="mt-2">
                         <div className="font-medium mb-1">Attempts Log ({selectedApiResponse.resolution.attemptsLog.length}):</div>
                         <div className="space-y-1 max-h-48 overflow-auto text-[9px]">
-                          {selectedApiResponse.resolution.attemptsLog.map((log, idx) => (
+                          {selectedApiResponse.resolution.attemptsLog.map((log: string, idx: number) => (
                             <div key={idx} className="text-gray-600 font-mono">{log}</div>
                           ))}
                         </div>

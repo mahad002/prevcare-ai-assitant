@@ -137,6 +137,7 @@ export default function TestMed2Page() {
   const [finalResult, setFinalResult] = useState<FinalResult | null>(null);
   const [llmComparison, setLlmComparison] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
+  const [dailyMedData, setDailyMedData] = useState<Record<string, any>>({}); // Store DailyMed raw data by RxCUI
 
   // Step 1: LLM Normalization
   const step1Normalize = useCallback(async (input: string): Promise<NormalizedData> => {
@@ -362,7 +363,7 @@ export default function TestMed2Page() {
   }, []);
 
   // Step 4: Fetch and verify NDCs (SPL_SET_ID → DailyMed → openFDA → RxNorm chain)
-  const step4FetchNDCs = useCallback(async (rxcui: string): Promise<NDCInfo[]> => {
+  const step4FetchNDCs = useCallback(async (rxcui: string): Promise<{ ndcs: NDCInfo[]; dailyMedRaw?: any }> => {
     setStep("Step 4: Fetching and verifying NDCs using SPL_SET_ID from DailyMed, openFDA, and RxNorm...");
     const ndcMap = new Map<string, { info: any; source: string; spl_set_id?: string }>(); // Track NDC with source priority and SPL_SET_ID
     const results: NDCInfo[] = [];
@@ -426,36 +427,60 @@ export default function TestMed2Page() {
     // 4.2 Verified NDC Retrieval Chain
     
     // Step 1: DailyMed (primary source) - if SPL Set ID available
+    let dailyMedRawData: any = null;
     if (splSetId) {
       try {
         const dailyMedRes = await fetch(`https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/${splSetId}/packaging.json`);
         if (dailyMedRes.ok) {
           const dailyMedJson = await dailyMedRes.json();
-          const packages = dailyMedJson?.data || dailyMedJson?.packaging || [];
+          dailyMedRawData = dailyMedJson; // Store raw data for display
           
-          for (const pkg of packages) {
-            const packageNdc = pkg.package_ndc || pkg.ndc;
-            const productNdc = pkg.product_ndc;
+          // Parse the actual DailyMed structure
+          // Structure: data.products[] -> each product has packaging[] array
+          const products = dailyMedJson?.data?.products || [];
+          
+          for (const product of products) {
+            const productName = product.product_name;
+            const productNameGeneric = product.product_name_generic;
+            const productCode = product.product_code;
+            const activeIngredients = product.active_ingredients || [];
             
-            if (packageNdc) {
-              const normalized = normalizeNDC(packageNdc);
-              if (!ndcMap.has(normalized)) {
-                ndcMap.set(normalized, {
-                  info: {
-                    labeler_name: pkg.labeler_name || pkg.manufacturer,
-                    brand_name: pkg.brand_name,
-                    package_description: pkg.description || pkg.package_description || "N/A",
-                    marketing_start: pkg.marketing_start_date,
-                    marketing_end: pkg.marketing_end_date,
-                    product_ndc: productNdc,
-                    product_type: pkg.product_type,
-                    route: pkg.route,
-                    dosage_form: pkg.dosage_form,
-                    finished: true, // DailyMed typically has active products
-                  },
-                  source: "DailyMed",
-                  spl_set_id: splSetId,
-                });
+            // Each product has packaging array
+            const packaging = product.packaging || [];
+            
+            for (const pkg of packaging) {
+              const packageNdc = pkg.ndc || pkg.package_ndc;
+              const packageDescriptions = pkg.package_descriptions || [];
+              const packageDescription = packageDescriptions.length > 0 
+                ? packageDescriptions.join(", ") 
+                : "N/A";
+              
+              if (packageNdc) {
+                const normalized = normalizeNDC(packageNdc);
+                if (!ndcMap.has(normalized)) {
+                  // Extract labeler from title if available
+                  const title = dailyMedJson?.data?.title || "";
+                  const labelerMatch = title.match(/\[([^\]]+)\]/);
+                  const labelerName = labelerMatch ? labelerMatch[1] : null;
+                  
+                  ndcMap.set(normalized, {
+                    info: {
+                      labeler_name: labelerName || "Unknown",
+                      brand_name: productName,
+                      package_description: packageDescription,
+                      product_ndc: productCode,
+                      product_type: "HUMAN PRESCRIPTION DRUG", // DailyMed default
+                      route: "ORAL", // Can be extracted from product if available
+                      dosage_form: "TABLET", // Can be extracted if available
+                      strength: activeIngredients.map((ai: any) => 
+                        `${ai.strength || ""} ${ai.name || ""}`.trim()
+                      ).join(", "),
+                      finished: true, // DailyMed typically has active products
+                    },
+                    source: "DailyMed",
+                    spl_set_id: splSetId,
+                  });
+                }
               }
             }
           }
@@ -711,7 +736,10 @@ export default function TestMed2Page() {
       });
     }
 
-    return results;
+    return {
+      ndcs: results,
+      dailyMedRaw: dailyMedRawData || undefined,
+    };
   }, []);
 
   // Helper: Process a single RxCUI into a FinalResultComponent
@@ -815,7 +843,8 @@ export default function TestMed2Page() {
     normalized: NormalizedData,
     candidates: RxCuiCandidate[],
     verifications: Record<string, VerificationResult>,
-    ndcs: Record<string, NDCInfo[]>
+    ndcs: Record<string, NDCInfo[]>,
+    setDailyMedDataFn?: (fn: (prev: Record<string, any>) => Record<string, any>) => void
   ): Promise<FinalResult> => {
     setStep("Step 5: Computing final output for SCD and SBD...");
 
@@ -893,7 +922,15 @@ export default function TestMed2Page() {
       let scdNDCs = ndcs[scdRxCui] || [];
       if (scdNDCs.length === 0) {
         // Fetch NDCs for SCD
-        scdNDCs = await step4FetchNDCs(scdRxCui);
+        const scdResult = await step4FetchNDCs(scdRxCui);
+        scdNDCs = scdResult.ndcs;
+        // Store DailyMed raw data if available
+        if (scdResult.dailyMedRaw && setDailyMedDataFn) {
+          setDailyMedDataFn(prev => ({
+            ...prev,
+            [scdRxCui]: scdResult.dailyMedRaw,
+          }));
+        }
       }
       scdComponent = await processRxCuiToComponent(
         scdRxCui,
@@ -925,7 +962,15 @@ export default function TestMed2Page() {
       let sbdNDCs = ndcs[sbdRxCui] || [];
       if (sbdNDCs.length === 0) {
         // Fetch NDCs for SBD (this will use DailyMed → openFDA → RxNorm chain)
-        sbdNDCs = await step4FetchNDCs(sbdRxCui);
+        const sbdResult = await step4FetchNDCs(sbdRxCui);
+        sbdNDCs = sbdResult.ndcs;
+        // Store DailyMed raw data if available
+        if (sbdResult.dailyMedRaw && setDailyMedDataFn) {
+          setDailyMedDataFn(prev => ({
+            ...prev,
+            [sbdRxCui]: sbdResult.dailyMedRaw,
+          }));
+        }
       }
       
       // Process SBD component with enhanced verification
@@ -1005,6 +1050,7 @@ export default function TestMed2Page() {
     setNdcResults({});
     setFinalResult(null);
     setLlmComparison(null);
+    setDailyMedData({});
 
     try {
       // Step 1: Normalize
@@ -1031,13 +1077,20 @@ export default function TestMed2Page() {
 
       let ndcData: Record<string, NDCInfo[]> = {};
       if (topCandidate) {
-        const ndcs = await step4FetchNDCs(topCandidate.candidate.rxcui);
-        ndcData[topCandidate.candidate.rxcui] = ndcs;
+        const result = await step4FetchNDCs(topCandidate.candidate.rxcui);
+        ndcData[topCandidate.candidate.rxcui] = result.ndcs;
         setNdcResults(ndcData);
+        // Store DailyMed raw data if available
+        if (result.dailyMedRaw) {
+          setDailyMedData(prev => ({
+            ...prev,
+            [topCandidate.candidate.rxcui]: result.dailyMedRaw,
+          }));
+        }
       }
 
       // Step 5: Final output (returns both SCD and SBD)
-      const final = await step5FinalOutput(input, normalized, cands, verifications, ndcData);
+      const final = await step5FinalOutput(input, normalized, cands, verifications, ndcData, setDailyMedData);
       setFinalResult(final);
 
       // Step 6: Optional LLM comparison for both SCD and SBD
@@ -1182,6 +1235,115 @@ export default function TestMed2Page() {
                 </div>
               ))}
           </div>
+        </section>
+      )}
+
+      {/* DailyMed Raw Data Section */}
+      {Object.keys(dailyMedData).length > 0 && (
+        <section className="mt-6 bg-purple-50 border-2 border-purple-300 rounded-xl shadow-sm p-4">
+          <h2 className="text-sm font-semibold text-purple-900 mb-3">
+            📋 DailyMed Packaging Data (Raw API Response)
+          </h2>
+          {Object.entries(dailyMedData).map(([rxcui, data]) => {
+            const splSetId = data?.data?.setid || "N/A";
+            const apiUrl = splSetId !== "N/A" 
+              ? `https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/${splSetId}/packaging.json`
+              : null;
+            return (
+            <div key={rxcui} className="mb-4 last:mb-0">
+              <div className="text-xs text-gray-600 mb-2">
+                RxCUI: <span className="font-mono">{rxcui}</span>
+                {apiUrl && (
+                  <span className="ml-2">
+                    | Source: <a href={apiUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline font-mono text-[10px]">DailyMed API</a>
+                  </span>
+                )}
+              </div>
+              {data && (
+                <div className="space-y-3">
+                  {/* Metadata */}
+                  {data.metadata && (
+                    <div className="bg-white rounded-lg p-3 border border-purple-200">
+                      <div className="text-xs font-semibold text-purple-900 mb-2">Metadata</div>
+                      <div className="space-y-1 text-[11px]">
+                        <div><span className="font-medium">Published Date:</span> {data.metadata.db_published_date || "N/A"}</div>
+                        <div><span className="font-medium">Current URL:</span> <a href={data.metadata.current_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline break-all text-[10px]">{data.metadata.current_url}</a></div>
+                      </div>
+                    </div>
+                  )}
+                  
+                  {/* Main Data */}
+                  {data.data && (
+                    <div className="bg-white rounded-lg p-3 border border-purple-200">
+                      <div className="text-xs font-semibold text-purple-900 mb-2">Product Information</div>
+                      <div className="space-y-2 text-[11px]">
+                        <div><span className="font-medium">Title:</span> {data.data.title || "N/A"}</div>
+                        <div><span className="font-medium">SPL Set ID:</span> <span className="font-mono text-[10px]">{data.data.setid || "N/A"}</span></div>
+                        <div><span className="font-medium">SPL Version:</span> {data.data.spl_version || "N/A"}</div>
+                        <div><span className="font-medium">Published Date:</span> {data.data.published_date || "N/A"}</div>
+                        
+                        {/* Products */}
+                        {data.data.products && data.data.products.length > 0 && (
+                          <div className="mt-3">
+                            <div className="text-xs font-semibold text-purple-800 mb-2">Products ({data.data.products.length}):</div>
+                            <div className="space-y-3">
+                              {data.data.products.map((product: any, idx: number) => (
+                                <div key={idx} className="bg-purple-50 rounded p-2 border border-purple-200">
+                                  <div className="font-semibold text-[11px] text-purple-900 mb-1">
+                                    Product #{idx + 1}: {product.product_name || "N/A"}
+                                  </div>
+                                  <div className="space-y-1 text-[10px] text-gray-700">
+                                    <div><span className="font-medium">Generic Name:</span> {product.product_name_generic || "N/A"}</div>
+                                    <div><span className="font-medium">Product Code:</span> <span className="font-mono">{product.product_code || "N/A"}</span></div>
+                                    
+                                    {/* Active Ingredients */}
+                                    {product.active_ingredients && product.active_ingredients.length > 0 && (
+                                      <div className="mt-1">
+                                        <span className="font-medium">Active Ingredients:</span>
+                                        <ul className="list-disc list-inside ml-2 mt-0.5">
+                                          {product.active_ingredients.map((ai: any, aiIdx: number) => (
+                                            <li key={aiIdx}>
+                                              {ai.strength || ""} {ai.name || ""}
+                                            </li>
+                                          ))}
+                                        </ul>
+                                      </div>
+                                    )}
+                                    
+                                    {/* Packaging */}
+                                    {product.packaging && product.packaging.length > 0 && (
+                                      <div className="mt-1">
+                                        <span className="font-medium">Packaging ({product.packaging.length}):</span>
+                                        <div className="ml-2 mt-0.5 space-y-1">
+                                          {product.packaging.map((pkg: any, pkgIdx: number) => (
+                                            <div key={pkgIdx} className="bg-white rounded p-1 border border-purple-100">
+                                              <div className="font-mono font-semibold text-purple-900">NDC: {pkg.ndc || "N/A"}</div>
+                                              {pkg.package_descriptions && pkg.package_descriptions.length > 0 && (
+                                                <div className="text-gray-600 mt-0.5">
+                                                  {pkg.package_descriptions.map((desc: string, descIdx: number) => (
+                                                    <div key={descIdx} className="text-[10px]">{desc}</div>
+                                                  ))}
+                                                </div>
+                                              )}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            );
+          })}
         </section>
       )}
 
