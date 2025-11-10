@@ -49,6 +49,21 @@ export default function RootLayout({
               <Link href="/medications/batch" className="text-sm text-slate-700 hover:text-slate-900">
                 Medications Batch
               </Link>
+              <Link href="/medications/fmb" className="text-sm text-slate-700 hover:text-slate-900">
+                FMB
+              </Link>
+              <Link href="/sql-browser" className="text-sm text-slate-700 hover:text-slate-900">
+                SQL Browser
+              </Link>
+              <Link href="/medication-comparison" className="text-sm text-slate-700 hover:text-slate-900">
+                Med Comparison
+              </Link>
+              <Link href="/test/approximate" className="text-sm text-slate-700 hover:text-slate-900">
+                Approx Compare
+              </Link>
+              <Link href="/test/approximate/audit" className="text-sm text-slate-700 hover:text-slate-900">
+                Approx Audit
+              </Link>
             </nav>
           </div>
         </header>

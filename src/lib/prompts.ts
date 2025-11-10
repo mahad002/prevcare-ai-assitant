@@ -251,25 +251,34 @@ export const medicationNormalizationPrompt = (medicationName: string) => {
   const med = medicationName?.trim() || "unspecified medication";
   return `You are a medication normalization expert with deep knowledge of RxNorm, FDA naming conventions, and pharmaceutical terminology.
 
-Task: Analyze the medication name "${med}" and extract structured information.
+Task: Analyze the medication name "${med}" and extract structured information in TWO formats:
+1. Canonical full name (normalized RxNorm-style string)
+2. Decomposed structure (for token-based comparison)
 
 Extract:
 - ingredient: The active ingredient (generic name) in proper case (e.g., "Amlodipine")
 - strength: The strength/dosage with unit in uppercase (e.g., "10 MG", "125 MG/5 ML", "250 MCG")
-- form: The dosage form in Title Case (e.g., "Oral Tablet", "Capsule", "Suspension", "Cream")
+- form: The dosage form in Title Case (e.g., "Oral Tablet", "Capsule", "Suspension", "Cream", "Inhalation Aerosol")
 - brand: The brand name if present (extract from brackets [Brand] or explicit brand mentions), or null if generic
-- normalized: The normalized RxNorm-style name in format "[Ingredient] [Strength] [Form]" (e.g., "Amlodipine 10 MG Oral Tablet")
+- normalized: The normalized RxNorm-style name in format "[Package/Quantity] [Ingredient] [Strength] [Form]" (e.g., "60 ACTUATE Albuterol 90 MCG/ACTUATE Inhalation Aerosol")
+- route: The route of administration if present (e.g., "Oral", "Topical", "Injection"), or null
+- package_quantity: Package/quantity information if present (e.g., "60 ACTUATE", "250 ML", "100 TABLET"), or null
 
 Rules:
 - Return STRICT JSON only, no explanations.
-- Keys: ingredient (string), strength (string|null), form (string|null), brand (string|null), normalized (string)
+- Keys: ingredient (string), strength (string|null), form (string|null), brand (string|null), route (string|null), package_quantity (string|null), normalized (string)
 - If strength is not present, set strength to null
 - If form is not present, set form to null (do NOT infer or guess)
 - If brand is not present, set brand to null
+- If route is not present, set route to null
+- If package_quantity is not present, set package_quantity to null
 - normalized should always be provided, even if some components are missing
-- For normalized: Use proper capitalization, spacing, and RxNorm conventions
+- For normalized: Include package/quantity at the start if present, then "[Ingredient] [Strength] [Form]"
+- Extract package/quantity information: quantities like "60 ACTUATE", "250 ML", "100 TABLET", "30 CAPSULE" should be preserved
+- Package/quantity includes: actuations, volume (ML), count (tablets/capsules), etc.
 - Extract brand names from brackets [Brand] or explicit mentions
-- Ignore package sizes (e.g., "250 ML bottle") - focus on medication strength only
+- Use proper capitalization, spacing, and RxNorm conventions
+- The decomposed structure helps with structured token comparison in later steps
 
 Examples:
 Input: "10 MG amlodipine Oral Tablet [Norvasc]"
@@ -278,6 +287,7 @@ Output: {
   "strength": "10 MG",
   "form": "Oral Tablet",
   "brand": "Norvasc",
+  "route": "Oral",
   "normalized": "Amlodipine 10 MG Oral Tablet"
 }
 
@@ -287,6 +297,7 @@ Output: {
   "strength": "500 MG",
   "form": "Capsule",
   "brand": null,
+  "route": "Oral",
   "normalized": "Amoxicillin 500 MG Capsule"
 }
 
@@ -296,7 +307,20 @@ Output: {
   "strength": "125 MG/5 ML",
   "form": "Suspension",
   "brand": "Amoxil",
-  "normalized": "Amoxicillin 125 MG/5 ML Suspension"
+  "route": "Oral",
+  "package_quantity": "250 ML",
+  "normalized": "250 ML Amoxicillin 125 MG/5 ML Oral Suspension"
+}
+
+Input: "60 ACTUATE albuterol 90 MCG/ACTUATE Inhalation Aerosol [Ventolin]"
+Output: {
+  "ingredient": "Albuterol",
+  "strength": "90 MCG/ACTUATE",
+  "form": "Inhalation Aerosol",
+  "brand": "Ventolin",
+  "route": "Inhalation",
+  "package_quantity": "60 ACTUATE",
+  "normalized": "60 ACTUATE Albuterol 90 MCG/ACTUATE Inhalation Aerosol"
 }
 
 Input: "lisinopril"
@@ -345,4 +369,114 @@ Format:
   "explanation": "Norvasc is the brand form of Amlodipine 10 MG Oral Tablet.",
   "confidence": 97
 }`;
+};
+
+// Synonym expansion prompt for generating query variants
+export const medicationSynonymExpansionPrompt = (normalized: {
+  ingredient: string;
+  strength: string | null;
+  form: string | null;
+  brand: string | null;
+  route: string | null;
+  package_quantity: string | null;
+}) => {
+  return `You are a medication synonym expansion expert with knowledge of RxNorm, FDA naming conventions, and pharmaceutical terminology.
+
+Task: Generate 3-5 query variants for searching RxNorm, reordering components and using alternative phrasings.
+
+Input medication structure:
+- Package/Quantity: ${normalized.package_quantity || "N/A"}
+- Ingredient: ${normalized.ingredient}
+- Strength: ${normalized.strength || "N/A"}
+- Form: ${normalized.form || "N/A"}
+- Brand: ${normalized.brand || "N/A"}
+- Route: ${normalized.route || "N/A"}
+
+Rules:
+- Return STRICT JSON only, no explanations.
+- Keys: variants (array of strings)
+- Generate 3-5 variants with different component orders and phrasings
+- Include brand name variants if brand is present
+- Use common abbreviations (tab for tablet, cap for capsule, etc.)
+- Examples:
+  * "[Ingredient] [Strength] [Form] [Brand]"
+  * "[Brand] [Strength] [Form]"
+  * "[Ingredient] [Form] [Strength]"
+  * "[Ingredient] [Strength] [Route] [Form]"
+
+Format:
+{
+  "variants": [
+    "Amlodipine 10 MG Oral Tablet [Norvasc]",
+    "Norvasc 10 MG Tablet",
+    "Amlodipine Oral Tablet 10 MG",
+    "10 MG Amlodipine Tablet [Norvasc]"
+  ]
+}`;
+};
+
+// Semantic entailment prompt for final verification
+export const medicationEntailmentPrompt = (input: string, rxnormName: string) => {
+  return `You are a semantic medication matching expert specializing in string entailment for pharmaceutical terminology.
+
+Task: Determine if the input medication description refers to the same concept as the RxNorm canonical name using semantic entailment.
+
+Input medication: "${input}"
+RxNorm canonical name: "${rxnormName}"
+
+Rules:
+- Return STRICT JSON only, no explanations.
+- Keys: entails (boolean), confidence (number, 0-100), reasoning (string, <= 150 chars)
+- entails: true if the input medication semantically entails (refers to) the RxNorm concept
+- confidence: Your confidence percentage (0-100) based on semantic similarity
+- Consider:
+  * Ingredient equivalence (e.g., "Amlodipine Besylate" = "Amlodipine")
+  * Brand-generic equivalence (e.g., "Norvasc" = "Amlodipine")
+  * Form equivalence (e.g., "Tablet" = "Oral Tablet")
+  * Strength equivalence (e.g., "10 MG" = "10.0 MG")
+- Be strict: minor differences in strength or form should reduce confidence
+
+Format:
+{
+  "entails": true,
+  "confidence": 95,
+  "reasoning": "Input refers to brand name Norvasc which matches the RxNorm concept for Amlodipine 10 MG Oral Tablet"
+}`;
+};
+
+export const medicationTextNormalizationPrompt = (medicationName: string) => {
+  const med = medicationName?.trim() || "unspecified medication";
+  return `
+You are a U.S. drug terminology expert trained to align medication names with the official terminology used in
+the National Library of Medicine’s RxNorm database and FDA's Structured Product Labeling (SPL) data.
+
+### GOAL
+Normalize the following medication text to the **closest exact marketed U.S. product name or standard
+RxNorm-style representation** — preserving all clinically relevant qualifiers such as:
+- dosage strength and unit,
+- delivery route and dosage form,
+- actuation count, vial size, or total volume,
+- brand vs. generic identity.
+
+### RULES
+1. **Do not generalize.** If the term includes device or package info (e.g., “60 actuations”, “inhaler”, “pen”, “vial”),
+   preserve it verbatim unless it conflicts with RxNorm wording.
+2. **Map wording to RxNorm/FDA vocabulary**, not arbitrary phrasing:
+   - “actuat”, “puff”, “spray” → “inhalation aerosol” or “metered dose inhaler”
+   - “ml vial” → “injection vial”
+   - “pen” → “prefilled pen injector”
+   - “suspension” vs. “solution” vs. “powder for reconstitution” → pick the RxNorm-equivalent.
+3. Keep **brand names in parentheses** at the end if present, e.g. “(Ventolin HFA)”.
+4. Use lower case for everything except brand names and abbreviations like “HFA”, “IV”, “IM”.
+5. Include the dosage count or package size (e.g., 60 actuations, 3 mL, 500 mL bag) if stated.
+6. Do **not** invent missing data or change strength values.
+7. Output **only valid JSON** with this schema:
+   {
+     "normalized": "<canonical US-marketed form>",
+     "note": "<one-sentence rationale>"
+   }
+
+### INPUT
+${med}
+`;
 };

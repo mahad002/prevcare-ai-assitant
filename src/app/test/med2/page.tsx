@@ -3,7 +3,7 @@
 import { useState, useCallback } from "react";
 import { callOpenAIRaw } from "../../../lib/api";
 import { getRxcuiProps, getNDCs, getFDAInfo } from "../../../lib/api";
-import { medicationNormalizationPrompt, medicationComparisonPrompt } from "../../../lib/prompts";
+import { medicationNormalizationPrompt, medicationComparisonPrompt, medicationSynonymExpansionPrompt, medicationEntailmentPrompt } from "../../../lib/prompts";
 
 // Normalize NDC to standard format (10 or 11 digits with hyphens)
 function normalizeNDC(ndc: string): string {
@@ -26,6 +26,8 @@ type NormalizedData = {
   strength: string | null;
   form: string | null;
   brand: string | null;
+  route: string | null;
+  package_quantity: string | null;
   normalized: string;
 };
 
@@ -41,12 +43,24 @@ type VerificationResult = {
   strengthMatch: number;
   formMatch: number;
   brandMatch: number;
+  routeMatch: number;
+  rxnormScore: number; // RxNorm's own approximateTerm score (0-100)
+  isActive: boolean; // If suppress = N and status = ACTIVE
   assurity: number;
   details: {
     ingredient: string;
     strength: string;
     form: string;
     brand: string;
+    route: string;
+    tty: string;
+    suppress: string;
+    status: string;
+  };
+  semanticEntailment?: {
+    entails: boolean;
+    confidence: number;
+    reasoning: string;
   };
 };
 
@@ -140,7 +154,7 @@ export default function TestMed2Page() {
   const [dailyMedData, setDailyMedData] = useState<Record<string, any>>({}); // Store DailyMed raw data by RxCUI
   const [fdaSplData, setFdaSplData] = useState<Record<string, any>>({}); // Store FDA SPL Set ID search data by RxCUI
 
-  // Step 1: LLM Normalization
+  // Step 1: Enhanced LLM Normalization (returns both canonical and decomposed structure)
   const step1Normalize = useCallback(async (input: string): Promise<NormalizedData> => {
     setStep("Step 1: LLM Normalization...");
     try {
@@ -153,6 +167,8 @@ export default function TestMed2Page() {
         strength: result.strength || null,
         form: result.form || null,
         brand: result.brand || null,
+        route: result.route || null,
+        package_quantity: result.package_quantity || null,
         normalized: result.normalized || input,
       };
     } catch (e) {
@@ -160,13 +176,101 @@ export default function TestMed2Page() {
     }
   }, []);
 
-  // Step 2: Fetch RxNorm Candidates
-  const step2FetchCandidates = useCallback(async (normalized: string): Promise<RxCuiCandidate[]> => {
-    setStep("Step 2: Fetching RxNorm Candidates...");
+  // Canonicalization Layer - Normalize medication tokens to RxNorm naming patterns
+  const canonicalizeMedicationName = useCallback((name: string): string => {
+    let canonical = name.toUpperCase();
+    
+    // Canonical mapping for RxNorm naming patterns
+    const canonicalMap: Record<string, string> = {
+      'ACTUATE': 'ACTUAT',
+      'ACTUATION': 'ACTUAT',
+      'ACTUATIONS': 'ACTUAT',
+      'GRAM': 'GM',
+      'GRAMS': 'GM',
+      'MILLIGRAM': 'MG',
+      'MILLIGRAMS': 'MG',
+      'MICROGRAM': 'MCG',
+      'MICROGRAMS': 'MCG',
+      'INHALATION': 'INHAL',
+      'SPRAY': 'AEROSOL',
+      'SPRAYS': 'AEROSOL',
+      'POWDER FOR ORAL SUSPENSION': 'POWDER FOR SUSPENSION',
+      'ORAL POWDER FOR SUSPENSION': 'POWDER FOR SUSPENSION',
+      'CAPSULE': 'CAP',
+      'CAPSULES': 'CAP',
+      'TABLET': 'TAB',
+      'TABLETS': 'TAB',
+      'SUSPENSION': 'SUSP',
+      'SOLUTION': 'SOL',
+      'LIQUID': 'SOL',
+    };
+    
+    // Apply canonical mappings (whole word replacement)
+    for (const [key, value] of Object.entries(canonicalMap)) {
+      // Use word boundaries to match whole words only
+      const regex = new RegExp(`\\b${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi');
+      canonical = canonical.replace(regex, value);
+    }
+    
+    return canonical;
+  }, []);
+
+  // Calculate Levenshtein distance between two strings
+  const levenshteinDistance = useCallback((str1: string, str2: string): number => {
+    const len1 = str1.length;
+    const len2 = str2.length;
+    const matrix: number[][] = [];
+    
+    for (let i = 0; i <= len1; i++) {
+      matrix[i] = [i];
+    }
+    
+    for (let j = 0; j <= len2; j++) {
+      matrix[0][j] = j;
+    }
+    
+    for (let i = 1; i <= len1; i++) {
+      for (let j = 1; j <= len2; j++) {
+        const cost = str1[i - 1].toLowerCase() === str2[j - 1].toLowerCase() ? 0 : 1;
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j] + 1,      // deletion
+          matrix[i][j - 1] + 1,      // insertion
+          matrix[i - 1][j - 1] + cost // substitution
+        );
+      }
+    }
+    
+    return matrix[len1][len2];
+  }, []);
+
+  // Calculate string similarity score (0-100, higher is better)
+  const calculateStringSimilarity = useCallback((str1: string, str2: string): number => {
+    const normalized1 = str1.toLowerCase().trim();
+    const normalized2 = str2.toLowerCase().trim();
+    
+    if (normalized1 === normalized2) return 100;
+    
+    const maxLen = Math.max(normalized1.length, normalized2.length);
+    if (maxLen === 0) return 100;
+    
+    const distance = levenshteinDistance(normalized1, normalized2);
+    const similarity = ((maxLen - distance) / maxLen) * 100;
+    
+    return Math.max(0, Math.min(100, similarity));
+  }, [levenshteinDistance]);
+
+  // Step 2: Enhanced Tiered RxNorm Query with Canonicalization and Related Expansion
+  const step2FetchCandidates = useCallback(async (
+    normalized: string,
+    normalizedData: NormalizedData
+  ): Promise<RxCuiCandidate[]> => {
+    setStep("Step 2: Tiered RxNorm Query (Exact → Approximate → Synonym Expansion)...");
     const candidates: RxCuiCandidate[] = [];
+    const seenRxCuis = new Set<string>();
     
     try {
-      // Try exact match
+      // Tier 1: Exact match (first priority)
+      setStep("Step 2.1: Exact match search...");
       const exactRes = await fetch(
         `https://rxnav.nlm.nih.gov/REST/rxcui.json?name=${encodeURIComponent(normalized)}`
       );
@@ -174,6 +278,7 @@ export default function TestMed2Page() {
         const exactJson = await exactRes.json();
         const ids: string[] = exactJson?.idGroup?.rxnormId || [];
         for (const id of ids) {
+          if (seenRxCuis.has(String(id))) continue;
           const props = await getRxcuiProps(String(id));
           if (props?.name) {
             candidates.push({
@@ -182,13 +287,15 @@ export default function TestMed2Page() {
               score: 100,
               source: "exact",
             });
+            seenRxCuis.add(String(id));
           }
         }
       }
 
-      // Try approximate match
+      // Tier 2: Approximate match (tokenized, maxEntries=20)
+      setStep("Step 2.2: Approximate match search...");
       const approxRes = await fetch(
-        `https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=${encodeURIComponent(normalized)}&maxEntries=10`
+        `https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=${encodeURIComponent(normalized)}`
       );
       if (approxRes.ok) {
         const approxJson = await approxRes.json();
@@ -198,31 +305,212 @@ export default function TestMed2Page() {
           const score = candidate?.score ? parseFloat(String(candidate.score)) : 0;
           const name = candidate?.name || "";
           
-          if (rxcui && score > 0 && !candidates.some(c => c.rxcui === rxcui)) {
+          if (rxcui && score > 0 && !seenRxCuis.has(rxcui)) {
             candidates.push({
               rxcui,
               name,
               score,
               source: "approximate",
             });
+            seenRxCuis.add(rxcui);
           }
+        }
+      }
+
+      // Step 2.4: TTY-Aware Re-ranking (post-scoring correction layer)
+      if (candidates.length > 0 && candidates.some(c => c.source === "approximate")) {
+        setStep("Step 2.4: TTY-aware re-ranking (brand vs generic)...");
+        const approximateCandidates = candidates.filter(c => c.source === "approximate");
+        const hasBrand = !!normalizedData.brand;
+        
+        for (const candidate of approximateCandidates) {
+          try {
+            const props = await getRxcuiProps(candidate.rxcui);
+            if (props) {
+              const tty = String(props.tty || "").toUpperCase();
+              
+              // TTY-based score adjustment using split scoring logic
+              if (hasBrand) {
+                // Brand scoring: Boost SBD, SBDF, SBDC; Demote SCD, DF, DFG
+                if (["SBD", "SBDF", "SBDC"].includes(tty)) {
+                  candidate.score *= 1.2;
+                  console.log(`Boosted ${candidate.rxcui} (${tty}) by 20% for brand scoring: ${candidate.score.toFixed(2)}`);
+                } else if (["SCD", "DF", "DFG"].includes(tty)) {
+                  candidate.score *= 0.8;
+                  console.log(`Demoted ${candidate.rxcui} (${tty}) by 20% for brand scoring: ${candidate.score.toFixed(2)}`);
+                } else if (["MIN", "PIN"].includes(tty)) {
+                  // Additional demotion for ingredient-level concepts
+                  candidate.score *= 0.7;
+                  console.log(`Demoted ${candidate.rxcui} (${tty}) by 30%: ${candidate.score.toFixed(2)}`);
+                }
+              } else {
+                // Generic scoring: Boost SCD, SCDF, SCDC; Demote SBD, SBDF, SBDC, DF, DFG
+                if (["SCD", "SCDF", "SCDC"].includes(tty)) {
+                  candidate.score *= 1.2;
+                  console.log(`Boosted ${candidate.rxcui} (${tty}) by 20% for generic scoring: ${candidate.score.toFixed(2)}`);
+                } else if (["SBD", "SBDF", "SBDC", "DF", "DFG"].includes(tty)) {
+                  candidate.score *= 0.8;
+                  console.log(`Demoted ${candidate.rxcui} (${tty}) by 20% for generic scoring: ${candidate.score.toFixed(2)}`);
+                } else if (["MIN", "PIN"].includes(tty)) {
+                  // Additional demotion for ingredient-level concepts
+                  candidate.score *= 0.7;
+                  console.log(`Demoted ${candidate.rxcui} (${tty}) by 30%: ${candidate.score.toFixed(2)}`);
+                }
+              }
+            }
+          } catch (e) {
+            console.warn(`Error fetching TTY for ${candidate.rxcui}:`, e);
+          }
+        }
+        
+        // Re-sort candidates after TTY weighting
+        candidates.sort((a, b) => {
+          // Keep exact matches at top
+          if (a.source === "exact" && b.source !== "exact") return -1;
+          if (b.source === "exact" && a.source !== "exact") return 1;
+          // Sort by adjusted score
+          return b.score - a.score;
+        });
+      }
+
+      // Tier 3: Synonym expansion fallback (if both fail or insufficient results)
+      if (candidates.length < 3) {
+        setStep("Step 2.5: Synonym expansion fallback...");
+        try {
+          // Generate synonyms using LLM
+          const synonymPrompt = medicationSynonymExpansionPrompt(normalizedData);
+          const { parsed: synonymResult } = await callOpenAIRaw("gpt-4o", synonymPrompt);
+          const variants: string[] = (synonymResult as any)?.variants || [];
+          
+          // Query each variant via approximateTerm (canonicalize first)
+          for (const variant of variants.slice(0, 5)) {
+            try {
+              const canonicalVariant = canonicalizeMedicationName(variant);
+              const variantRes = await fetch(
+                `https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=${encodeURIComponent(canonicalVariant)}&maxEntries=5`
+              );
+              if (variantRes.ok) {
+                const variantJson = await variantRes.json();
+                const variantCandidates = variantJson?.approximateGroup?.candidate || [];
+                for (const candidate of variantCandidates) {
+                  const rxcui = candidate?.rxcui ? String(candidate.rxcui) : null;
+                  const rxnormScore = candidate?.score ? parseFloat(String(candidate.score)) : 0;
+                  const name = candidate?.name || "";
+                  
+                  if (rxcui && rxnormScore > 0 && !seenRxCuis.has(rxcui)) {
+                    // Apply lexical re-scoring to synonym variants too
+                    const stringSimilarity = calculateStringSimilarity(normalized, name);
+                    const finalScore = (rxnormScore * 0.7 * 0.9) + (stringSimilarity * 0.3 * 0.9); // Reduced for variant
+                    
+                    candidates.push({
+                      rxcui,
+                      name,
+                      score: finalScore,
+                      source: "approximate",
+                    });
+                    seenRxCuis.add(rxcui);
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn(`Error querying variant "${variant}":`, e);
+            }
+          }
+        } catch (e) {
+          console.warn("Synonym expansion failed:", e);
+        }
+      }
+
+      // Tier 4: Ingredient-only search (fallback if still no results)
+      if (candidates.length === 0 && normalizedData.ingredient) {
+        setStep("Step 2.6: Ingredient-only search fallback...");
+        try {
+          const ingredientRes = await fetch(
+            `https://rxnav.nlm.nih.gov/REST/rxcui.json?name=${encodeURIComponent(normalizedData.ingredient)}`
+          );
+          if (ingredientRes.ok) {
+            const ingredientJson = await ingredientRes.json();
+            const ids: string[] = ingredientJson?.idGroup?.rxnormId || [];
+            for (const id of ids.slice(0, 3)) {
+              if (seenRxCuis.has(String(id))) continue;
+              const props = await getRxcuiProps(String(id));
+              if (props?.name) {
+                candidates.push({
+                  rxcui: String(id),
+                  name: props.name,
+                  score: 60, // Lower score for ingredient-only match
+                  source: "approximate",
+                });
+                seenRxCuis.add(String(id));
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("Ingredient-only search failed:", e);
         }
       }
     } catch (e) {
       console.error("Error fetching candidates:", e);
     }
 
-    // Sort by score descending
-    return candidates.sort((a, b) => b.score - a.score);
-  }, []);
+    // Sort by score descending (after all expansions and re-scoring)
+    return candidates.sort((a, b) => {
+      // Keep exact matches at top
+      if (a.source === "exact" && b.source !== "exact") return -1;
+      if (b.source === "exact" && a.source !== "exact") return 1;
+      // Sort by adjusted score
+      return b.score - a.score;
+    });
+  }, [canonicalizeMedicationName, calculateStringSimilarity]);
 
-  // Step 3: Cross-verify with weighted scoring
+  // Step 3: Enhanced Cross-verification with Improved Weighting and TTY Verification
   const step3Verify = useCallback(async (
     normalized: NormalizedData,
     candidates: RxCuiCandidate[]
   ): Promise<Record<string, VerificationResult>> => {
-    setStep("Step 3: Cross-verifying candidates...");
+    setStep("Step 3: Enhanced cross-verification with weighted scoring and TTY verification...");
     const results: Record<string, VerificationResult> = {};
+    
+    // Determine expected TTY based on input (brand vs generic)
+    const hasBrand = !!normalized.brand;
+    const expectedTTY = hasBrand ? ["SBD", "SBDF", "SBDC"] : ["SCD", "SCDF", "SCDC"];
+    
+    // Helper functions for split scoring (brand vs generic)
+    const calculateBrandAssurity = (
+      ingredientMatch: number,
+      strengthMatch: number,
+      formMatch: number,
+      routeMatch: number,
+      brandMatch: number,
+      rxnormScore: number
+    ): number => {
+      // Brand-oriented scoring: Brand(35%), Ingredient(30%), Form(15%), Strength(10%), Route(5%), RxNorm(5%)
+      return (
+        0.35 * brandMatch +
+        0.30 * ingredientMatch +
+        0.15 * formMatch +
+        0.10 * strengthMatch +
+        0.05 * routeMatch +
+        0.05 * rxnormScore
+      ) * 100;
+    };
+    
+    const calculateGenericAssurity = (
+      ingredientMatch: number,
+      strengthMatch: number,
+      formMatch: number,
+      routeMatch: number,
+      rxnormScore: number
+    ): number => {
+      // Generic-oriented scoring: Ingredient(40%), Strength(25%), Form(15%), Route(10%), RxNorm(10%)
+      return (
+        0.40 * ingredientMatch +
+        0.25 * strengthMatch +
+        0.15 * formMatch +
+        0.10 * routeMatch +
+        0.10 * rxnormScore
+      ) * 100;
+    };
 
     for (const candidate of candidates.slice(0, 5)) { // Top 5 candidates
       try {
@@ -233,12 +521,326 @@ export default function TestMed2Page() {
         const rxSynonym = String(props.synonym || "");
         const synonyms = rxSynonym ? rxSynonym.split("|").map(s => s.trim()).filter(Boolean) : [];
         const allNames = [rxName, ...synonyms].map(n => n.toLowerCase());
+        const tty = String(props.tty || "");
+        const suppress = String(props.suppress || "");
+        const status = String(props.status || "");
 
         // Normalize strings for comparison
         const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+        
+        // Extract strength with unit normalization support
+        // Enhanced to capture more unit types
         const extractStrength = (s: string) => {
-          const match = s.match(/(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|%)\b/i);
-          return match ? `${match[1]} ${match[2].toUpperCase()}` : null;
+          // Match patterns like "1000 MG", "1 G", "500 MCG", "125 MG/5 ML", "100 IU", "2 ACTUATE", etc.
+          // Try to match common medication units
+          const patterns = [
+            /(\d+(?:\.\d+)?)\s*(MG|MCG|UG|G|KG|ML|L|CL|DL|IU|MEQ|ACTUATE|PUFF|SPRAY|%|FL\s*OZ|TSP|TBSP|TABLESPOON|TEASPOON)\b/i,
+            /(\d+(?:\.\d+)?)\s*(MG|MCG|G|ML)\s*\/\s*(\d+(?:\.\d+)?)\s*(MG|MCG|G|ML)\b/i, // Ratios
+          ];
+          
+          for (const pattern of patterns) {
+            const match = s.match(pattern);
+            if (match) {
+              if (match[3] && match[4]) {
+                // Ratio format
+                return `${match[1]} ${match[2].toUpperCase()}/${match[3]} ${match[4].toUpperCase()}`;
+              }
+              return `${match[1]} ${match[2].toUpperCase()}`;
+            }
+          }
+          
+          return null;
+        };
+        
+        // Comprehensive unit conversion registry for medications
+        const UNIT_CONVERSIONS: Record<string, {
+          type: 'weight' | 'volume' | 'special' | 'percentage';
+          toBase: (value: number) => number; // Convert to base unit (MG for weight, ML for volume)
+          fromBase: (value: number) => number; // Convert from base unit
+        }> = {
+          // Weight units (base: MG)
+          'KG': { type: 'weight', toBase: (v) => v * 1000000, fromBase: (v) => v / 1000000 }, // 1 KG = 1,000,000 MG
+          'G': { type: 'weight', toBase: (v) => v * 1000, fromBase: (v) => v / 1000 }, // 1 G = 1000 MG
+          'MG': { type: 'weight', toBase: (v) => v, fromBase: (v) => v }, // Base unit
+          'MCG': { type: 'weight', toBase: (v) => v / 1000, fromBase: (v) => v * 1000 }, // 1 MCG = 0.001 MG
+          'UG': { type: 'weight', toBase: (v) => v / 1000, fromBase: (v) => v * 1000 }, // UG = MCG
+          'NG': { type: 'weight', toBase: (v) => v / 1000000, fromBase: (v) => v * 1000000 }, // 1 NG = 0.000001 MG
+          'OZ': { type: 'weight', toBase: (v) => v * 28349.5, fromBase: (v) => v / 28349.5 }, // 1 OZ (weight) = 28.3495 G = 28349.5 MG
+          'OUNCE': { type: 'weight', toBase: (v) => v * 28349.5, fromBase: (v) => v / 28349.5 }, // Weight ounce
+          'LB': { type: 'weight', toBase: (v) => v * 453592, fromBase: (v) => v / 453592 }, // 1 LB = 453.592 G = 453592 MG
+          
+          // Volume units (base: ML)
+          'L': { type: 'volume', toBase: (v) => v * 1000, fromBase: (v) => v / 1000 }, // 1 L = 1000 ML
+          'LITER': { type: 'volume', toBase: (v) => v * 1000, fromBase: (v) => v / 1000 },
+          'ML': { type: 'volume', toBase: (v) => v, fromBase: (v) => v }, // Base unit
+          'CL': { type: 'volume', toBase: (v) => v * 10, fromBase: (v) => v / 10 }, // 1 CL = 10 ML
+          'DL': { type: 'volume', toBase: (v) => v * 100, fromBase: (v) => v / 100 }, // 1 DL = 100 ML
+          'FL OZ': { type: 'volume', toBase: (v) => v * 29.5735, fromBase: (v) => v / 29.5735 }, // 1 FL OZ = 29.5735 ML
+          'FLUID OUNCE': { type: 'volume', toBase: (v) => v * 29.5735, fromBase: (v) => v / 29.5735 }, // Fluid ounce
+          'FLUID OZ': { type: 'volume', toBase: (v) => v * 29.5735, fromBase: (v) => v / 29.5735 }, // Fluid oz
+          'TSP': { type: 'volume', toBase: (v) => v * 4.92892, fromBase: (v) => v / 4.92892 }, // 1 TSP = 4.92892 ML
+          'TBSP': { type: 'volume', toBase: (v) => v * 14.7868, fromBase: (v) => v / 14.7868 }, // 1 TBSP = 14.7868 ML
+          'TABLESPOON': { type: 'volume', toBase: (v) => v * 14.7868, fromBase: (v) => v / 14.7868 },
+          'TEASPOON': { type: 'volume', toBase: (v) => v * 4.92892, fromBase: (v) => v / 4.92892 },
+          'DROPS': { type: 'volume', toBase: (v) => v * 0.05, fromBase: (v) => v / 0.05 }, // 1 drop ≈ 0.05 ML
+          'GTTS': { type: 'volume', toBase: (v) => v * 0.05, fromBase: (v) => v / 0.05 }, // gtts = drops
+          
+          // Special units (cannot convert, must match exactly)
+          'IU': { type: 'special', toBase: (v) => v, fromBase: (v) => v }, // International Units
+          'UNITS': { type: 'special', toBase: (v) => v, fromBase: (v) => v }, // Units (insulin, etc.)
+          'UNIT': { type: 'special', toBase: (v) => v, fromBase: (v) => v },
+          'MEQ': { type: 'special', toBase: (v) => v, fromBase: (v) => v }, // Milliequivalents
+          'MEQL': { type: 'special', toBase: (v) => v, fromBase: (v) => v }, // Milliequivalents per liter
+          'MMOL': { type: 'special', toBase: (v) => v, fromBase: (v) => v }, // Millimoles
+          'MMOL/L': { type: 'special', toBase: (v) => v, fromBase: (v) => v },
+          'MG/KG': { type: 'special', toBase: (v) => v, fromBase: (v) => v }, // Per kilogram (dosage)
+          'MCG/KG': { type: 'special', toBase: (v) => v, fromBase: (v) => v },
+          'MG/M2': { type: 'special', toBase: (v) => v, fromBase: (v) => v }, // Per square meter
+          'ACTUATE': { type: 'special', toBase: (v) => v, fromBase: (v) => v }, // Actuations (inhalers)
+          'PUFF': { type: 'special', toBase: (v) => v, fromBase: (v) => v }, // Puffs (inhalers)
+          'SPRAY': { type: 'special', toBase: (v) => v, fromBase: (v) => v }, // Sprays (nasal)
+          
+          // Percentage
+          '%': { type: 'percentage', toBase: (v) => v, fromBase: (v) => v },
+          'PERCENT': { type: 'percentage', toBase: (v) => v, fromBase: (v) => v },
+        };
+        
+        // Normalize unit name (handle variations like "FL OZ", "FL.OZ", "FL_OZ", etc.)
+        const normalizeUnitName = (unit: string): string => {
+          const normalized = unit.toUpperCase().trim()
+            .replace(/[._-]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          
+          // Handle common variations
+          const variations: Record<string, string> = {
+            'FLOZ': 'FL OZ',
+            'FL OZ': 'FL OZ',
+            'FLUID OUNCE': 'FL OZ',
+            'FLUID OZ': 'FL OZ',
+            'TSP': 'TSP',
+            'TSPN': 'TSP',
+            'TEASPOON': 'TSP',
+            'TBSP': 'TBSP',
+            'TABLESPOON': 'TBSP',
+            'MCG': 'MCG',
+            'UG': 'MCG',
+            'MICROGRAM': 'MCG',
+            'MG': 'MG',
+            'MILLIGRAM': 'MG',
+            'G': 'G',
+            'GRAM': 'G',
+            'KG': 'KG',
+            'KILOGRAM': 'KG',
+            'ML': 'ML',
+            'MILLILITER': 'ML',
+            'MILLILITRE': 'ML',
+            'L': 'L',
+            'LITER': 'L',
+            'LITRE': 'L',
+            'IU': 'IU',
+            'UNITS': 'UNITS',
+            'UNIT': 'UNITS',
+            'MEQ': 'MEQ',
+            'MEQL': 'MEQ',
+            'ACTUATE': 'ACTUATE',
+            'ACTUATION': 'ACTUATE',
+            'PUFF': 'PUFF',
+            'PUFFS': 'PUFF',
+            'SPRAY': 'SPRAY',
+            'SPRAYS': 'SPRAY',
+          };
+          
+          return variations[normalized] || normalized;
+        };
+        
+        // Normalize strength to base units for comparison
+        // Converts: all weight to MG, all volume to ML, special units stay as-is
+        const normalizeStrengthToBaseUnit = (strength: string): { 
+          value: number; 
+          unit: string; 
+          normalizedUnit: string;
+          valueInBase: number;
+          unitType: 'weight' | 'volume' | 'special' | 'percentage';
+        } | null => {
+          if (!strength) return null;
+          
+          // Enhanced regex to capture more unit patterns
+          // Matches: "1000 MG", "1 G", "500 MCG", "125 MG/5 ML", "100 IU", "2 ACTUATE", etc.
+          const match = strength.match(/(\d+(?:\.\d+)?)\s*([A-Z%\/\s]+?)(?:\s|$|\/|,|;)/i);
+          if (!match) {
+            // Try simpler pattern
+            const simpleMatch = strength.match(/(\d+(?:\.\d+)?)\s*(MG|MCG|UG|G|KG|ML|L|IU|MEQ|ACTUATE|PUFF|SPRAY|%)\b/i);
+            if (!simpleMatch) return null;
+            const value = parseFloat(simpleMatch[1]);
+            const unit = normalizeUnitName(simpleMatch[2]);
+            const conversion = UNIT_CONVERSIONS[unit];
+            if (!conversion) return { value, unit, normalizedUnit: unit, valueInBase: value, unitType: 'special' };
+            
+            return {
+              value,
+              unit: simpleMatch[2].toUpperCase(),
+              normalizedUnit: unit,
+              valueInBase: conversion.toBase(value),
+              unitType: conversion.type,
+            };
+          }
+          
+          const value = parseFloat(match[1]);
+          const rawUnit = match[2].trim();
+          const unit = normalizeUnitName(rawUnit);
+          
+          const conversion = UNIT_CONVERSIONS[unit];
+          if (!conversion) {
+            // Unknown unit, return as-is
+            return { value, unit: rawUnit.toUpperCase(), normalizedUnit: unit, valueInBase: value, unitType: 'special' };
+          }
+          
+          return {
+            value,
+            unit: rawUnit.toUpperCase(),
+            normalizedUnit: unit,
+            valueInBase: conversion.toBase(value),
+            unitType: conversion.type,
+          };
+        };
+        
+        // Compare strengths with unit normalization
+        const compareStrengths = (strength1: string | null, strength2: string | null): number => {
+          if (!strength1 || !strength2) {
+            if (!strength1 && !strength2) return 1; // Both missing = match
+            return 0; // One missing, one present = no match
+          }
+          
+          // Handle ratios like "125 MG/5 ML", "250 MG/5 ML", etc.
+          if (strength1.includes('/') || strength2.includes('/')) {
+            // For ratios, do exact string comparison (after normalization)
+            const normalized1 = strength1.replace(/\s+/g, ' ').trim().toUpperCase();
+            const normalized2 = strength2.replace(/\s+/g, ' ').trim().toUpperCase();
+            if (normalized1 === normalized2) return 1;
+            
+            // Try to parse and compare ratios using comprehensive unit conversion
+            // Match patterns like "125 MG/5 ML", "250 MG/10 ML", etc.
+            const ratioPattern = /(\d+(?:\.\d+)?)\s*([A-Z%\/\s]+?)\s*\/\s*(\d+(?:\.\d+)?)\s*([A-Z%\/\s]+?)(?:\s|$|,|;)/i;
+            const ratio1Match = strength1.match(ratioPattern);
+            const ratio2Match = strength2.match(ratioPattern);
+            
+            if (ratio1Match && ratio2Match) {
+              const num1 = parseFloat(ratio1Match[1]);
+              const unit1Raw = ratio1Match[2].trim();
+              const den1 = parseFloat(ratio1Match[3]);
+              const unit1DenRaw = ratio1Match[4].trim();
+              
+              const num2 = parseFloat(ratio2Match[1]);
+              const unit2Raw = ratio2Match[2].trim();
+              const den2 = parseFloat(ratio2Match[3]);
+              const unit2DenRaw = ratio2Match[4].trim();
+              
+              // Normalize unit names
+              const unit1 = normalizeUnitName(unit1Raw);
+              const unit1Den = normalizeUnitName(unit1DenRaw);
+              const unit2 = normalizeUnitName(unit2Raw);
+              const unit2Den = normalizeUnitName(unit2DenRaw);
+              
+              // Get conversion functions
+              const conv1 = UNIT_CONVERSIONS[unit1];
+              const conv1Den = UNIT_CONVERSIONS[unit1Den];
+              const conv2 = UNIT_CONVERSIONS[unit2];
+              const conv2Den = UNIT_CONVERSIONS[unit2Den];
+              
+              // Both numerator and denominator must have compatible units
+              if (conv1 && conv2 && conv1Den && conv2Den) {
+                // Numerators must be same type (both weight or both volume)
+                // Denominators must be same type (both weight or both volume)
+                if (conv1.type === conv2.type && conv1Den.type === conv2Den.type) {
+                  // Convert to base units
+                  const num1Base = conv1.toBase(num1);
+                  const num2Base = conv2.toBase(num2);
+                  const den1Base = conv1Den.toBase(den1);
+                  const den2Base = conv2Den.toBase(den2);
+                  
+                  // Compare ratios
+                  const ratio1Value = num1Base / den1Base;
+                  const ratio2Value = num2Base / den2Base;
+                  
+                  const tolerance = 0.001;
+                  if (Math.abs(ratio1Value - ratio2Value) < tolerance) {
+                    return 1; // Exact match
+                  }
+                  
+                  const maxRatio = Math.max(Math.abs(ratio1Value), Math.abs(ratio2Value), 0.0001);
+                  const deviation = Math.abs(ratio1Value - ratio2Value) / maxRatio;
+                  
+                  if (deviation < 0.01) return 1; // Very close (within 1%)
+                  if (deviation < 0.1) return 0.5; // Within 10%
+                  if (deviation < 0.2) return 0.3; // Within 20%
+                }
+              }
+              
+              return 0;
+            }
+            
+            return 0;
+          }
+          
+          // Normalize both strengths to base units
+          const norm1 = normalizeStrengthToBaseUnit(strength1);
+          const norm2 = normalizeStrengthToBaseUnit(strength2);
+          
+          if (!norm1 || !norm2) {
+            // Fallback to exact string comparison
+            return strength1.toUpperCase() === strength2.toUpperCase() ? 1 : 0;
+          }
+          
+          // Get normalized values (already converted to base units)
+          const value1InBase = norm1.valueInBase;
+          const value2InBase = norm2.valueInBase;
+          
+          // Handle special units - must match exactly (same unit type and value)
+          if (norm1.unitType === 'special' || norm2.unitType === 'special') {
+            // For special units, compare exact unit names and values
+            if (norm1.unitType === 'special' && norm2.unitType === 'special') {
+              // Both are special units - must be same unit type
+              if (norm1.normalizedUnit === norm2.normalizedUnit) {
+                const tolerance = 0.001;
+                if (Math.abs(value1InBase - value2InBase) < tolerance) {
+                  return 1; // Exact match
+                }
+                // Allow small deviation for special units
+                const deviation = Math.abs(value1InBase - value2InBase) / Math.max(Math.abs(value1InBase), Math.abs(value2InBase), 0.0001);
+                if (deviation < 0.01) return 1;
+                if (deviation < 0.1) return 0.5;
+              }
+              return 0; // Different special unit types
+            }
+            // One is special, one is not - no match
+            return 0;
+          }
+          
+          // Only compare if units are compatible (both weight, both volume, or both percentage)
+          if (norm1.unitType !== norm2.unitType) {
+            return 0; // Incompatible units (weight vs volume, etc.)
+          }
+          
+          // Compare normalized values with tolerance for floating point errors
+          const tolerance = 0.001;
+          if (Math.abs(value1InBase - value2InBase) < tolerance) {
+            return 1; // Exact match (e.g., 1000 MG = 1 G, 1000 MCG = 1 MG, 1 L = 1000 ML)
+          }
+          
+          // Check for close match (small differences due to rounding)
+          const maxValue = Math.max(Math.abs(value1InBase), Math.abs(value2InBase), 0.0001);
+          const deviation = Math.abs(value1InBase - value2InBase) / maxValue;
+          
+          if (deviation < 0.01) {
+            return 1; // Very close (within 1% - likely same value with rounding)
+          } else if (deviation < 0.1) {
+            return 0.5; // Within 10%
+          } else if (deviation < 0.2) {
+            return 0.3; // Within 20%
+          }
+          
+          return 0; // No match
         };
         const extractIngredient = (s: string) => {
           const normalized = normalize(s);
@@ -247,7 +849,7 @@ export default function TestMed2Page() {
         };
         const extractForm = (s: string) => {
           const normalized = normalize(s);
-          const forms = ["tablet", "capsule", "solution", "suspension", "cream", "ointment", "injection", "spray", "patch"];
+          const forms = ["tablet", "capsule", "solution", "suspension", "cream", "ointment", "injection", "spray", "patch", "gel", "lotion", "foam"];
           for (const form of forms) {
             if (normalized.includes(form)) return form;
           }
@@ -257,8 +859,38 @@ export default function TestMed2Page() {
           const match = s.match(/\[([^\]]+)\]/);
           return match ? match[1].toLowerCase() : null;
         };
+        const extractRoute = (s: string) => {
+          const normalized = normalize(s);
+          const routes = ["oral", "topical", "injection", "intravenous", "intramuscular", "subcutaneous", "rectal", "vaginal", "ophthalmic", "otic", "nasal", "inhalation"];
+          for (const route of routes) {
+            if (normalized.includes(route)) return route;
+          }
+          return null;
+        };
 
-        // Ingredient match (40% weight)
+        // Fetch route from related.json if available
+        let rxRoute: string | null = null;
+        try {
+          const relatedRes = await fetch(`https://rxnav.nlm.nih.gov/REST/rxcui/${candidate.rxcui}/related.json?tty=DF`);
+          if (relatedRes.ok) {
+            const relatedJson = await relatedRes.json();
+            const conceptGroups = relatedJson?.relatedGroup?.conceptGroup || [];
+            for (const group of conceptGroups) {
+              if (group?.tty === "DF" && group?.conceptProperties?.[0]?.name) {
+                rxRoute = extractRoute(String(group.conceptProperties[0].name));
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          // Route fetch failed, use extracted route from name
+          rxRoute = extractRoute(rxName);
+        }
+        if (!rxRoute) {
+          rxRoute = extractRoute(rxName);
+        }
+
+        // Enhanced Ingredient match (40% weight) - with synonym equivalence
         const inputIngredient = normalize(normalized.ingredient);
         const rxIngredient = extractIngredient(rxName);
         let ingredientMatch = 0;
@@ -266,32 +898,35 @@ export default function TestMed2Page() {
           ingredientMatch = 1;
         } else if (allNames.some(n => extractIngredient(n) === inputIngredient)) {
           ingredientMatch = 0.5; // Partial match via synonym
+        } else {
+          // Fuzzy match: check if ingredient is contained in synonym or vice versa
+          const fuzzyMatch = allNames.some(n => {
+            const ing = extractIngredient(n);
+            return ing && (ing.includes(inputIngredient) || inputIngredient.includes(ing));
+          });
+          if (fuzzyMatch) {
+            ingredientMatch = 0.3; // Weak fuzzy match
+          }
         }
 
-        // Strength match (30% weight)
+        // Enhanced Strength match (20% weight) - with unit normalization
         let strengthMatch = 0;
         if (normalized.strength) {
-          const inputStrength = extractStrength(normalized.strength);
+          const inputStrength = normalized.strength;
           const rxStrength = extractStrength(rxName);
-          if (inputStrength && rxStrength) {
-            if (inputStrength === rxStrength) {
-              strengthMatch = 1;
-            } else {
-              // Check if close (e.g., "10 MG" vs "10.0 MG")
-              const inputNum = parseFloat(inputStrength);
-              const rxNum = parseFloat(rxStrength);
-              if (!isNaN(inputNum) && !isNaN(rxNum) && Math.abs(inputNum - rxNum) < 0.1) {
-                strengthMatch = 0.5;
-              }
-            }
-          } else if (!normalized.strength && !rxStrength) {
+          
+          // Use normalized comparison function
+          strengthMatch = compareStrengths(inputStrength, rxStrength);
+          
+          // If no match found, check if both are missing
+          if (strengthMatch === 0 && !inputStrength && !rxStrength) {
             strengthMatch = 1; // Both missing strength
           }
         } else {
           strengthMatch = 1; // Input has no strength requirement
         }
 
-        // Form match (20% weight)
+        // Enhanced Form match (15% weight) - with LLM token mapping for equivalents
         let formMatch = 0;
         if (normalized.form) {
           const inputForm = extractForm(normalized.form.toLowerCase());
@@ -300,12 +935,19 @@ export default function TestMed2Page() {
             if (inputForm === rxForm) {
               formMatch = 1;
             } else {
-              // Check for equivalent forms
+              // Check for equivalent forms with expanded mapping
               const equivalents: Record<string, string[]> = {
-                tablet: ["tablet", "tab"],
-                capsule: ["capsule", "cap"],
-                suspension: ["suspension", "susp"],
-                solution: ["solution", "sol"],
+                tablet: ["tablet", "tab", "oral tablet"],
+                capsule: ["capsule", "cap", "oral capsule"],
+                suspension: ["suspension", "susp", "oral suspension"],
+                solution: ["solution", "sol", "oral solution"],
+                cream: ["cream", "topical cream"],
+                ointment: ["ointment", "topical ointment"],
+                gel: ["gel", "topical gel"],
+                lotion: ["lotion", "topical lotion"],
+                injection: ["injection", "injectable", "inject"],
+                spray: ["spray", "nasal spray", "oral spray"],
+                patch: ["patch", "transdermal patch"],
               };
               const inputEquiv = equivalents[inputForm] || [inputForm];
               const rxEquiv = equivalents[rxForm] || [rxForm];
@@ -318,7 +960,20 @@ export default function TestMed2Page() {
           formMatch = 1; // Input has no form requirement
         }
 
-        // Brand match (10% weight)
+        // Enhanced Route match (10% weight)
+        let routeMatch = 0;
+        if (normalized.route) {
+          const inputRoute = normalize(normalized.route);
+          if (rxRoute && inputRoute === rxRoute) {
+            routeMatch = 1;
+          } else if (rxRoute && inputRoute.includes(rxRoute) || (rxRoute && rxRoute.includes(inputRoute))) {
+            routeMatch = 0.5; // Partial route match
+          }
+        } else {
+          routeMatch = 1; // Input has no route requirement
+        }
+
+        // Brand match (10% weight) - exact match case-insensitive
         let brandMatch = 0;
         if (normalized.brand) {
           const inputBrand = normalize(normalized.brand);
@@ -339,20 +994,97 @@ export default function TestMed2Page() {
           brandMatch = 1; // No brand specified
         }
 
-        // Calculate assurity
-        const assurity = (0.4 * ingredientMatch + 0.3 * strengthMatch + 0.2 * formMatch + 0.1 * brandMatch) * 100;
+        // RxNorm score (5% weight) - use RxNorm's own approximateTerm score
+        const rxnormScore = candidate.score || 0;
+        const rxnormScoreNormalized = Math.min(rxnormScore / 100, 1); // Normalize to 0-1
+
+        // Active concept bonus (+5% if suppress = N and status = ACTIVE)
+        const isActive = suppress === "N" && (status === "ACTIVE" || status === "");
+        const activeBonus = isActive ? 0.05 : 0;
+
+        // Calculate assurity using split scoring pipelines
+        let baseAssurity: number;
+        const scoringModel = hasBrand ? "brand" : "generic";
+        
+        if (scoringModel === "brand") {
+          // Brand-oriented scoring: Brand(35%), Ingredient(30%), Form(15%), Strength(10%), Route(5%), RxNorm(5%)
+          baseAssurity = (
+            0.35 * brandMatch +
+            0.30 * ingredientMatch +
+            0.15 * formMatch +
+            0.10 * strengthMatch +
+            0.05 * routeMatch +
+            0.05 * rxnormScoreNormalized
+          ) * 100;
+        } else {
+          // Generic-oriented scoring: Ingredient(40%), Strength(25%), Form(15%), Route(10%), RxNorm(10%)
+          baseAssurity = (
+            0.40 * ingredientMatch +
+            0.25 * strengthMatch +
+            0.15 * formMatch +
+            0.10 * routeMatch +
+            0.10 * rxnormScoreNormalized
+          ) * 100;
+        }
+        
+        // Apply TTY-based boost/demote based on scoring model
+        let ttyMultiplier = 1.0;
+        if (scoringModel === "brand") {
+          // Boost SBD, SBDF, SBDC candidates
+          if (["SBD", "SBDF", "SBDC"].includes(tty)) {
+            ttyMultiplier = 1.2;
+            console.log(`Boosted ${candidate.rxcui} (${tty}) by 20% for brand scoring`);
+          }
+          // Demote SCD, DF, DFG candidates
+          else if (["SCD", "DF", "DFG"].includes(tty)) {
+            ttyMultiplier = 0.8;
+            console.log(`Demoted ${candidate.rxcui} (${tty}) by 20% for brand scoring`);
+          }
+        } else {
+          // Boost SCD, SCDF, SCDC candidates
+          if (["SCD", "SCDF", "SCDC"].includes(tty)) {
+            ttyMultiplier = 1.2;
+            console.log(`Boosted ${candidate.rxcui} (${tty}) by 20% for generic scoring`);
+          }
+          // Demote SBD, SBDF, SBDC, DF, DFG candidates
+          else if (["SBD", "SBDF", "SBDC", "DF", "DFG"].includes(tty)) {
+            ttyMultiplier = 0.8;
+            console.log(`Demoted ${candidate.rxcui} (${tty}) by 20% for generic scoring`);
+          }
+        }
+        
+        // Apply TTY multiplier and active bonus
+        const assurity = Math.min((baseAssurity * ttyMultiplier) + (activeBonus * 100), 100);
+        
+        // Bonus Improvement: Promote candidates with high assurity regardless of raw score
+        // This helps when a candidate has perfect ingredient+form+brand match but low RxNorm score
+        if (assurity >= 90) {
+          // Store original score for logging
+          const originalScore = candidate.score;
+          // Promote to at least 95, or use assurity score if it's a meaningful boost
+          const promotedScore = Math.max(candidate.score, Math.min(95, assurity));
+          candidate.score = promotedScore;
+          console.log(`Promoted ${candidate.rxcui} from ${originalScore.toFixed(1)} to ${promotedScore.toFixed(1)} due to high assurity (${assurity.toFixed(1)}%)`);
+        }
 
         results[candidate.rxcui] = {
           ingredientMatch,
           strengthMatch,
           formMatch,
           brandMatch,
+          routeMatch,
+          rxnormScore: rxnormScore,
+          isActive,
           assurity,
           details: {
             ingredient: rxName,
             strength: extractStrength(rxName) || "N/A",
             form: extractForm(rxName) || "N/A",
             brand: extractBrand(rxName) || "N/A",
+            route: rxRoute || "N/A",
+            tty: tty || "N/A",
+            suppress: suppress || "N/A",
+            status: status || "N/A",
           },
         };
       } catch (e) {
@@ -360,10 +1092,198 @@ export default function TestMed2Page() {
       }
     }
 
+    // TTY Verification Layer: If top candidate doesn't match expected TTY, try to find related one
+    if (Object.keys(results).length > 0) {
+      setStep("Step 3.5: TTY verification layer...");
+      const sortedCandidates = candidates
+        .map(c => ({ candidate: c, verification: results[c.rxcui] }))
+        .filter(v => v.verification)
+        .sort((a, b) => (b.verification?.assurity || 0) - (a.verification?.assurity || 0));
+      
+      if (sortedCandidates.length > 0) {
+        const topCandidate = sortedCandidates[0];
+        const topTTY = topCandidate.verification.details.tty.toUpperCase();
+        
+        // Check if top candidate matches expected TTY
+        const matchesExpectedTTY = expectedTTY.some(t => topTTY === t);
+        
+        if (!matchesExpectedTTY && topCandidate.verification.assurity >= 70) {
+          // Try to find related candidate with correct TTY
+          try {
+            const relatedRes = await fetch(
+              `https://rxnav.nlm.nih.gov/REST/rxcui/${topCandidate.candidate.rxcui}/related.json?tty=${expectedTTY.join("+")}`
+            );
+            if (relatedRes.ok) {
+              const relatedJson = await relatedRes.json();
+              const conceptGroups = relatedJson?.relatedGroup?.conceptGroup || [];
+              
+              for (const group of conceptGroups) {
+                const groupTTY = group?.tty?.toUpperCase();
+                if (expectedTTY.includes(groupTTY)) {
+                  const concepts = group?.conceptProperties || [];
+                  if (concepts.length > 0) {
+                    const relatedRxcui = String(concepts[0]?.rxcui || "");
+                    if (relatedRxcui && !results[relatedRxcui]) {
+                      // Verify the related candidate
+                      const relatedCandidate: RxCuiCandidate = {
+                        rxcui: relatedRxcui,
+                        name: String(concepts[0]?.name || ""),
+                        score: topCandidate.candidate.score * 0.95, // Slightly lower than original
+                        source: "approximate",
+                      };
+                      // Verify the related candidate inline (avoid recursion)
+                      try {
+                        const relatedProps = await getRxcuiProps(relatedRxcui);
+                        if (relatedProps) {
+                          const relatedRxName = String(relatedProps.name || "");
+                          const relatedTty = String(relatedProps.tty || "").toUpperCase();
+                          
+                          // Quick verification: check if name similarity is good
+                          const nameSimilarity = calculateStringSimilarity(normalized.normalized, relatedRxName);
+                          
+                          // If similarity is high enough, add it to results with calculated assurity
+                          if (nameSimilarity >= 70) {
+                            // Use a simplified assurity calculation for TTY-matched candidates
+                            const ttyMatchedAssurity = Math.min(
+                              topCandidate.verification.assurity * 0.95 + 10, // Slight boost for TTY match
+                              100
+                            );
+                            
+                            // Create a verification result for the TTY-matched candidate
+                            results[relatedRxcui] = {
+                              ...topCandidate.verification,
+                              assurity: ttyMatchedAssurity,
+                              details: {
+                                ...topCandidate.verification.details,
+                                ingredient: relatedRxName,
+                                tty: relatedTty,
+                              },
+                            };
+                            
+                            console.log(`TTY verification: Found TTY-matched candidate ${relatedRxcui} (${groupTTY}) for expected TTY ${expectedTTY.join("/")} with assurity ${ttyMatchedAssurity.toFixed(1)}%`);
+                          }
+                        }
+                      } catch (e) {
+                        console.warn(`Error verifying TTY-matched candidate ${relatedRxcui}:`, e);
+                      }
+                    }
+                  }
+                  break;
+                }
+              }
+            }
+          } catch (e) {
+            console.warn(`TTY verification failed for ${topCandidate.candidate.rxcui}:`, e);
+          }
+        }
+      }
+    }
+
     return results;
+  }, [calculateStringSimilarity]);
+
+  // Step 4: Semantic Verification (LLM Entailment Check)
+  const step4SemanticVerification = useCallback(async (
+    input: string,
+    topCandidates: Array<{ rxcui: string; name: string; verification: VerificationResult }>
+  ): Promise<Record<string, VerificationResult>> => {
+    setStep("Step 4: Semantic verification with LLM entailment check...");
+    const updatedResults: Record<string, VerificationResult> = {};
+
+    for (const candidate of topCandidates.slice(0, 3)) { // Top 3 candidates for semantic check
+      try {
+        const props = await getRxcuiProps(candidate.rxcui);
+        if (!props) continue;
+
+        const rxnormName = String(props.name || "");
+        
+        // Run LLM entailment check
+        const entailmentPrompt = medicationEntailmentPrompt(input, rxnormName);
+        const { parsed: entailmentResult } = await callOpenAIRaw("gpt-4o", entailmentPrompt);
+        const entailment = entailmentResult as any;
+
+        // Update verification result with semantic entailment
+        updatedResults[candidate.rxcui] = {
+          ...candidate.verification,
+          semanticEntailment: {
+            entails: entailment.entails || false,
+            confidence: entailment.confidence || 0,
+            reasoning: entailment.reasoning || "",
+          },
+        };
+
+        // If semantic entailment confidence is high, boost assurity slightly
+        if (entailment.entails && entailment.confidence >= 90) {
+          updatedResults[candidate.rxcui].assurity = Math.min(
+            100,
+            updatedResults[candidate.rxcui].assurity + 3
+          );
+        } else if (!entailment.entails || entailment.confidence < 50) {
+          // Penalize if entailment fails or low confidence
+          updatedResults[candidate.rxcui].assurity = Math.max(
+            0,
+            updatedResults[candidate.rxcui].assurity - 5
+          );
+        }
+      } catch (e) {
+        console.warn(`Semantic verification failed for ${candidate.rxcui}:`, e);
+        updatedResults[candidate.rxcui] = candidate.verification;
+      }
+    }
+
+    return updatedResults;
   }, []);
 
-  // Step 4: Fetch and verify NDCs (SPL_SET_ID → DailyMed → openFDA → RxNorm chain)
+  // Step 5: Cross-Verification with OpenFDA
+  const step5CrossVerifyFDA = useCallback(async (
+    rxcui: string,
+    brand: string | null
+  ): Promise<{ fdaLinked: boolean; fdaMappingPending: boolean }> => {
+    setStep("Step 5: Cross-verification with OpenFDA...");
+    
+    try {
+      // Check if RxCUI is linked in FDA database
+      const fdaRes = await fetch(
+        `https://api.fda.gov/drug/ndc.json?search=openfda.rxcui="${rxcui}"&limit=1`
+      );
+      
+      if (fdaRes.ok) {
+        const fdaJson = await fdaRes.json();
+        const resultCount = fdaJson?.meta?.results?.total || 0;
+        
+        if (resultCount > 0) {
+          return { fdaLinked: true, fdaMappingPending: false };
+        }
+      }
+
+      // Fallback: brand-name search if RxCUI search fails
+      if (brand) {
+        try {
+          const brandRes = await fetch(
+            `https://api.fda.gov/drug/ndc.json?search=brand_name="${encodeURIComponent(brand)}"&limit=1`
+          );
+          
+          if (brandRes.ok) {
+            const brandJson = await brandRes.json();
+            const brandResultCount = brandJson?.meta?.results?.total || 0;
+            
+            if (brandResultCount > 0) {
+              return { fdaLinked: false, fdaMappingPending: true };
+            }
+          }
+        } catch (e) {
+          console.warn("FDA brand search failed:", e);
+        }
+      }
+
+      return { fdaLinked: false, fdaMappingPending: false };
+    } catch (e) {
+      console.warn("FDA cross-verification failed:", e);
+      return { fdaLinked: false, fdaMappingPending: false };
+    }
+  }, []);
+
+  // Step 6: Fetch and verify NDCs (SPL_SET_ID → DailyMed → openFDA → RxNorm chain)
   const step4FetchNDCs = useCallback(async (rxcui: string): Promise<{ ndcs: NDCInfo[]; dailyMedRaw?: any; fdaSplRaw?: any }> => {
     setStep("Step 4: Fetching and verifying NDCs using SPL_SET_ID from DailyMed, openFDA, and RxNorm...");
     const ndcMap = new Map<string, { info: any; source: string; spl_set_id?: string }>(); // Track NDC with source priority and SPL_SET_ID
@@ -465,6 +1385,7 @@ export default function TestMed2Page() {
         if (dailyMedRes.ok) {
           const dailyMedJson = await dailyMedRes.json();
           console.log("DailyMed JSON received:", dailyMedJson);
+          console.log("DailyMed SPL Set ID from data.setid:", dailyMedJson?.data?.setid);
           dailyMedRawData = dailyMedJson; // Store raw data for display
           
           // Parse the actual DailyMed structure
@@ -918,29 +1839,56 @@ export default function TestMed2Page() {
 
     const baseRxCui = bestCandidate.candidate.rxcui;
 
-    // 2️⃣ Fetch related RxCUIs with SCD and SBD TTY types
+    // 2️⃣ Enhanced Related Expansion using allrelated.json
     let scdRxCui: string | null = null;
     let sbdRxCui: string | null = null;
+    let ingredientRxCui: string | null = null;
+    let doseFormRxCui: string | null = null;
 
     try {
-      const relatedRes = await fetch(`https://rxnav.nlm.nih.gov/REST/rxcui/${baseRxCui}/related.json?tty=SCD+SBD`);
-      if (relatedRes.ok) {
-        const relatedJson = await relatedRes.json();
-        const conceptGroups = relatedJson?.relatedGroup?.conceptGroup || [];
+      // Use allrelated.json for comprehensive related concept retrieval
+      const allRelatedRes = await fetch(`https://rxnav.nlm.nih.gov/REST/rxcui/${baseRxCui}/allrelated.json`);
+      if (allRelatedRes.ok) {
+        const allRelatedJson = await allRelatedRes.json();
+        const conceptGroups = allRelatedJson?.allRelatedGroup?.conceptGroup || [];
         
         for (const group of conceptGroups) {
           const tty = group?.tty;
           const concepts = group?.conceptProperties || [];
           
-          if (tty === "SCD" && concepts.length > 0) {
+          if (tty === "SCD" && concepts.length > 0 && !scdRxCui) {
             scdRxCui = String(concepts[0]?.rxcui || "");
-          } else if (tty === "SBD" && concepts.length > 0) {
+          } else if (tty === "SBD" && concepts.length > 0 && !sbdRxCui) {
             sbdRxCui = String(concepts[0]?.rxcui || "");
+          } else if (tty === "IN" && concepts.length > 0 && !ingredientRxCui) {
+            ingredientRxCui = String(concepts[0]?.rxcui || "");
+          } else if (tty === "DF" && concepts.length > 0 && !doseFormRxCui) {
+            doseFormRxCui = String(concepts[0]?.rxcui || "");
+          }
+        }
+      }
+      
+      // Fallback to related.json if allrelated.json fails
+      if (!scdRxCui && !sbdRxCui) {
+        const relatedRes = await fetch(`https://rxnav.nlm.nih.gov/REST/rxcui/${baseRxCui}/related.json?tty=SCD+SBD`);
+        if (relatedRes.ok) {
+          const relatedJson = await relatedRes.json();
+          const conceptGroups = relatedJson?.relatedGroup?.conceptGroup || [];
+          
+          for (const group of conceptGroups) {
+            const tty = group?.tty;
+            const concepts = group?.conceptProperties || [];
+            
+            if (tty === "SCD" && concepts.length > 0 && !scdRxCui) {
+              scdRxCui = String(concepts[0]?.rxcui || "");
+            } else if (tty === "SBD" && concepts.length > 0 && !sbdRxCui) {
+              sbdRxCui = String(concepts[0]?.rxcui || "");
+            }
           }
         }
       }
     } catch (e) {
-      console.warn("Error fetching related SCD/SBD:", e);
+      console.warn("Error fetching related concepts:", e);
     }
 
     // 3️⃣ Process SCD (Semantic Clinical Drug - generic)
@@ -1116,18 +2064,50 @@ export default function TestMed2Page() {
       setNormalizedData(normalized);
 
       // Step 2: Fetch candidates
-      const cands = await step2FetchCandidates(normalized.normalized);
+      // Step 2: Enhanced tiered RxNorm query with synonym expansion
+      const cands = await step2FetchCandidates(normalized.normalized, normalized);
       setCandidates(cands);
 
       if (cands.length === 0) {
         throw new Error("No RxNorm candidates found");
       }
 
-      // Step 3: Verify candidates
-      const verifications = await step3Verify(normalized, cands);
+      // Step 3: Enhanced cross-verification with improved weighting
+      let verifications = await step3Verify(normalized, cands);
       setVerificationResults(verifications);
 
-      // Step 4: Fetch NDCs for top candidate
+      // Step 4: Semantic verification (LLM entailment check) for top candidates
+      const topCandidates = cands
+        .slice(0, 3)
+        .map(c => ({
+          rxcui: c.rxcui,
+          name: c.name,
+          verification: verifications[c.rxcui],
+        }))
+        .filter(c => c.verification);
+      
+      if (topCandidates.length > 0) {
+        const semanticUpdates = await step4SemanticVerification(med, topCandidates);
+        // Merge semantic updates back into verifications
+        verifications = { ...verifications, ...semanticUpdates };
+        setVerificationResults(verifications);
+      }
+
+      // Step 5: Cross-verification with OpenFDA (for best candidate)
+      const bestCandidate = cands
+        .map(c => ({ candidate: c, verification: verifications[c.rxcui] }))
+        .filter(v => v.verification)
+        .sort((a, b) => (b.verification?.assurity || 0) - (a.verification?.assurity || 0))[0];
+      
+      if (bestCandidate) {
+        const fdaVerification = await step5CrossVerifyFDA(
+          bestCandidate.candidate.rxcui,
+          normalized.brand
+        );
+        console.log("FDA Cross-Verification:", fdaVerification);
+      }
+
+      // Step 6: Fetch NDCs for top candidate
       const topCandidate = cands
         .map(c => ({ candidate: c, verification: verifications[c.rxcui] }))
         .filter(v => v.verification)
@@ -1153,11 +2133,11 @@ export default function TestMed2Page() {
         }
       }
 
-      // Step 5: Final output (returns both SCD and SBD)
+      // Step 7: Final output (returns both SCD and SBD)
       const final = await step5FinalOutput(input, normalized, cands, verifications, ndcData, setDailyMedData);
       setFinalResult(final);
 
-      // Step 6: Optional LLM comparison for both SCD and SBD
+      // Step 8: Optional LLM comparison for both SCD and SBD
       const llmComparisons: Record<string, number> = {};
       
       if (final.scd?.rxnorm_name) {
@@ -1192,7 +2172,7 @@ export default function TestMed2Page() {
     } finally {
       setLoading(false);
     }
-  }, [med, step1Normalize, step2FetchCandidates, step3Verify, step4FetchNDCs, step5FinalOutput, step6LLMComparison]);
+  }, [med, step1Normalize, step2FetchCandidates, step3Verify, step4SemanticVerification, step4FetchNDCs, step5CrossVerifyFDA, step5FinalOutput, step6LLMComparison]);
 
   return (
     <main className="mx-auto max-w-7xl p-4 sm:p-6">
@@ -1324,10 +2304,16 @@ export default function TestMed2Page() {
             
             return (
               <div key={rxcui} className="mb-6 last:mb-0">
-                <div className="text-xs text-gray-600 mb-3">
-                  RxCUI: <span className="font-mono">{rxcui}</span>
-                  {splSetId !== "N/A" && (
-                    <span className="ml-2">| SPL Set ID: <span className="font-mono text-[10px]">{splSetId}</span></span>
+                <div className="bg-yellow-50 border border-yellow-300 rounded p-2 mb-3">
+                  <div className="text-xs font-semibold text-gray-900 mb-1">
+                    RxCUI: <span className="font-mono bg-white px-1 rounded">{rxcui}</span>
+                  </div>
+                  {splSetId !== "N/A" ? (
+                    <div className="text-xs font-semibold text-gray-900">
+                      SPL Set ID: <span className="font-mono bg-yellow-100 px-2 py-1 rounded text-purple-900 font-bold">{splSetId}</span>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-red-600">⚠️ SPL Set ID: Not found</div>
                   )}
                 </div>
                 
@@ -1358,6 +2344,10 @@ export default function TestMed2Page() {
                               <div><span className="font-medium">Title:</span> {dailyMed.data.title || "N/A"}</div>
                               <div><span className="font-medium">Version:</span> {dailyMed.data.spl_version || "N/A"}</div>
                               <div><span className="font-medium">Published:</span> {dailyMed.data.published_date || "N/A"}</div>
+                              <div className="bg-purple-100 rounded p-1 mt-1">
+                                <span className="font-semibold">SPL Set ID:</span> 
+                                <span className="font-mono text-purple-900 font-bold ml-1 text-xs">{dailyMed.data.setid || "N/A"}</span>
+                              </div>
                             </div>
                             
                             {/* Products */}
@@ -1375,6 +2365,10 @@ export default function TestMed2Page() {
                                         <span className="font-bold">{isSCD ? "Name:" : "Brand:"}</span> {product.product_name || "N/A"} <span className="text-gray-600">({product.product_code || "N/A"})</span>
                                       </div>
                                       <div className="text-[9px] text-gray-700 space-y-0.5">
+                                        <div className="bg-purple-200 rounded px-1 py-0.5 mb-1">
+                                          <span className="font-semibold text-[9px]">SPL Set ID:</span> 
+                                          <span className="font-mono text-purple-900 font-bold ml-1 text-[9px]">{dailyMed.data.setid || "N/A"}</span>
+                                        </div>
                                         <div><span className="font-medium">Generic:</span> {product.product_name_generic || "N/A"}</div>
                                         <div><span className="font-medium">Brand Name:</span> {product.product_name || "N/A"}</div>
                                         {product.active_ingredients && product.active_ingredients.length > 0 && (
@@ -1452,6 +2446,16 @@ export default function TestMed2Page() {
                                     <span className="font-bold">{isSCD ? "Name:" : "Brand:"}</span> {result.brand_name || "N/A"} <span className="text-gray-600">({result.product_ndc || "N/A"})</span>
                                   </div>
                                   <div className="text-[9px] text-gray-700 space-y-0.5">
+                                    <div className="bg-blue-200 rounded px-1 py-0.5 mb-1">
+                                      <span className="font-semibold text-[9px]">SPL Set ID:</span> 
+                                      <span className="font-mono text-blue-900 font-bold ml-1 text-[9px]">
+                                        {result.openfda?.spl_set_id 
+                                          ? (Array.isArray(result.openfda.spl_set_id) 
+                                              ? result.openfda.spl_set_id[0] 
+                                              : result.openfda.spl_set_id)
+                                          : "N/A"}
+                                      </span>
+                                    </div>
                                     <div><span className="font-medium">Generic:</span> {result.generic_name || "N/A"}</div>
                                     <div><span className="font-medium">Brand Name:</span> {result.brand_name || "N/A"}</div>
                                     <div><span className="font-medium">Labeler:</span> {result.labeler_name || "N/A"}</div>
