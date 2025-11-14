@@ -477,20 +477,38 @@ function scoreCandidate(
   qDrugWords: string[]
 ): number {
   const cToks = c.tokens ?? normalize(c.name);
+  
+  // --------------------------------------------------------------
+  // HARD RULE: Ingredient Gating (RxNav-style)
+  // Candidate must share at least one normalized ingredient token
+  // --------------------------------------------------------------
+  if (qDrugWords.length > 0 && c.ingredients && c.ingredients.length > 0) {
+    // Build a token set from the candidate's ingredient strings
+    const ingredientTokens = new Set<string>();
 
-  // Drug-word requirement (RxNav: at least one IN/BN-like word must appear)
-  if (qDrugWords.length > 0) {
-    const cDrugWords = extractDrugWords(cToks);
-    const cSet = new Set(cDrugWords);
-    const hasAny = qDrugWords.some((dw) => cSet.has(dw));
-    if (!hasAny) return 0;
+    for (const ing of c.ingredients) {
+      // Normalize and extract only drug-like tokens from the ingredient string
+      const ingTokens = extractDrugWords(normalize(ing));
+      for (const t of ingTokens) {
+        ingredientTokens.add(t.toLowerCase().trim());
+      }
+    }
+
+    const hasIngredientMatch = qDrugWords.some(dw =>
+      ingredientTokens.has(dw.toLowerCase().trim())
+    );
+
+    if (!hasIngredientMatch) {
+      return 0; // Reject candidate immediately
+    }
   }
+  // --------------------------------------------------------------
+  
+  if (qDrugWords.length > 0) { const cDrugWords = extractDrugWords(cToks); const cSet = new Set(cDrugWords); const hasAny = qDrugWords.some((dw) => cSet.has(dw)); if (!hasAny) return 0; }
 
-  // Route compatibility: if query has "Injection", prefer injection-like candidates
-  if (hints.routeHint && !routeCompatible(hints.routeHint, c)) {
-    return 0;
-  }
-
+  // Route compatibility: if query has "Injection", prefer injection-like candidates 
+  if (hints.routeHint && !routeCompatible(hints.routeHint, c)) { return 0; }
+  // --------------------------------------------------------------
   const overlapW = weightedOverlap(qTokens, cToks);
   const jac = jaccard(qTokens, cToks);
   const ed = tokenEditSim(qTokens, cToks);

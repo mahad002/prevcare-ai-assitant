@@ -23,6 +23,7 @@ const navigationGroups: NavGroup[] = [
       { href: "/", label: "Home", description: "Home page" },
       { href: "/rrf-search", label: "RRF Search", description: "RxNorm RRF approximate search" },
       { href: "/sql-browser", label: "SQL Browser", description: "Browse medication SQL database" },
+      { href: "/llm-search", label: "LLM Search", description: "Generate medications using LLM and validate" },
     ],
   },
   {
