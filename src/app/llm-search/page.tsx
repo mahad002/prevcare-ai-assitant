@@ -23,6 +23,14 @@ interface MedicationResult {
     };
     [key: string]: unknown;
   } | null;
+  rxnavStatusResponse: {
+    rxcuiStatus?: {
+      rxcui?: string;
+      status?: string;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  } | null;
   rxnavExists: boolean;
   rxnavError?: string;
   rrfExists: boolean;
@@ -340,25 +348,59 @@ export default function LLMSearchPage() {
 
   const fetchRxNavData = async (rxcui: string) => {
     try {
-      const response = await fetch(
-        `https://rxnav.nlm.nih.gov/REST/rxcui/${rxcui}/properties.json`
-      );
-      if (!response.ok) {
+      const [propertiesResponse, statusResponse] = await Promise.all([
+        fetch(`https://rxnav.nlm.nih.gov/REST/rxcui/${rxcui}/properties.json`),
+        fetch(`https://rxnav.nlm.nih.gov/REST/rxcui/${rxcui}/status.json`),
+      ]);
+
+      let propertiesData: {
+        properties?: {
+          rxcui?: string;
+          name?: string;
+          synonym?: string;
+          tty?: string;
+          language?: string;
+          suppress?: string;
+          status?: string;
+          umlscui?: string;
+          [key: string]: unknown;
+        };
+        [key: string]: unknown;
+      } | null = null;
+      let statusData: {
+        rxcuiStatus?: {
+          rxcui?: string;
+          status?: string;
+          [key: string]: unknown;
+        };
+        [key: string]: unknown;
+      } | null = null;
+
+      if (propertiesResponse.ok) {
+        propertiesData = await propertiesResponse.json();
+      }
+
+      if (statusResponse.ok) {
+        statusData = await statusResponse.json();
+      }
+
+      if (!propertiesResponse.ok) {
         return {
           exists: false,
           response: null,
-          error: `HTTP ${response.status}: ${response.statusText}`,
+          statusResponse: statusData,
+          error: `HTTP ${propertiesResponse.status}: ${propertiesResponse.statusText}`,
         };
       }
-      const data = await response.json();
       
       // Check if response has properties - empty {} means RxCUI doesn't exist
-      const hasProperties = data?.properties && Object.keys(data.properties).length > 0;
+      const hasProperties = propertiesData?.properties && Object.keys(propertiesData.properties).length > 0;
       
       if (!hasProperties) {
         return {
           exists: false,
-          response: data,
+          response: propertiesData,
+          statusResponse: statusData,
           error: 'Empty response - RxCUI not found',
         };
       }
@@ -367,8 +409,8 @@ export default function LLMSearchPage() {
       // - If status field exists, it must be "Active"
       // - If suppress field exists, it must be "N" (not suppressed)
       // - If neither exists, consider it valid if properties exist
-      const status = data?.properties?.status;
-      const suppress = data?.properties?.suppress;
+      const status = propertiesData?.properties?.status;
+      const suppress = propertiesData?.properties?.suppress;
       
       let isValid = true;
       if (status !== undefined) {
@@ -380,13 +422,15 @@ export default function LLMSearchPage() {
       
       return {
         exists: isValid,
-        response: data,
+        response: propertiesData,
+        statusResponse: statusData,
         error: isValid ? undefined : `RxCUI exists but is ${status ? `inactive (status: ${status})` : `suppressed (suppress: ${suppress})`}`,
       };
     } catch (err) {
       return {
         exists: false,
         response: null,
+        statusResponse: null,
         error: err instanceof Error ? err.message : String(err),
       };
     }
@@ -460,6 +504,7 @@ export default function LLMSearchPage() {
       const initialResults: MedicationResult[] = medications.map((med) => ({
         medication: med,
         rxnavResponse: null,
+        rxnavStatusResponse: null,
         rxnavExists: false,
         rrfExists: false,
         rrfHasSU: false,
@@ -479,6 +524,7 @@ export default function LLMSearchPage() {
         return {
           medication: med,
           rxnavResponse: rxnavData.response,
+          rxnavStatusResponse: rxnavData.statusResponse,
           rxnavExists: rxnavData.exists,
           rxnavError: rxnavData.error,
           rrfExists: rrfData.exists,
@@ -729,16 +775,58 @@ export default function LLMSearchPage() {
                             )}
                           </div>
                         )}
-                        {result.rxnavResponse && (
-                          <details className="text-xs">
-                            <summary className="cursor-pointer text-gray-600 hover:text-gray-900">
-                              View Full API Response
-                            </summary>
-                            <pre className="mt-2 max-h-40 overflow-auto rounded bg-gray-50 p-2 text-[10px]">
-                              {JSON.stringify(result.rxnavResponse, null, 2)}
-                            </pre>
-                          </details>
+                        {result.rxnavStatusResponse && (
+                          <div className="text-xs text-gray-600 space-y-1 mt-2 pt-2 border-t border-gray-200">
+                            <div className="font-medium text-gray-700">Status API Response:</div>
+                            {result.rxnavStatusResponse.rxcuiStatus ? (
+                              <>
+                                {result.rxnavStatusResponse.rxcuiStatus.rxcui && (
+                                  <div>
+                                    <span className="font-medium">RxCUI:</span> {result.rxnavStatusResponse.rxcuiStatus.rxcui}
+                                  </div>
+                                )}
+                                {result.rxnavStatusResponse.rxcuiStatus.status && (
+                                  <div>
+                                    <span className="font-medium">Status:</span>{" "}
+                                    <span
+                                      className={
+                                        result.rxnavStatusResponse.rxcuiStatus.status === "Active"
+                                          ? "text-green-600"
+                                          : "text-red-600"
+                                      }
+                                    >
+                                      {result.rxnavStatusResponse.rxcuiStatus.status}
+                                    </span>
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              <div className="text-gray-500 italic">Status response received (see full response below)</div>
+                            )}
+                          </div>
                         )}
+                        <div className="flex flex-col gap-2 mt-2">
+                          {result.rxnavResponse && (
+                            <details className="text-xs">
+                              <summary className="cursor-pointer text-gray-600 hover:text-gray-900">
+                                View Properties API Response
+                              </summary>
+                              <pre className="mt-2 max-h-40 overflow-auto rounded bg-gray-50 p-2 text-[10px]">
+                                {JSON.stringify(result.rxnavResponse, null, 2)}
+                              </pre>
+                            </details>
+                          )}
+                          {result.rxnavStatusResponse && (
+                            <details className="text-xs">
+                              <summary className="cursor-pointer text-gray-600 hover:text-gray-900">
+                                View Status API Response
+                              </summary>
+                              <pre className="mt-2 max-h-40 overflow-auto rounded bg-gray-50 p-2 text-[10px]">
+                                {JSON.stringify(result.rxnavStatusResponse, null, 2)}
+                              </pre>
+                            </details>
+                          )}
+                        </div>
                         {!result.rxnavResponse?.properties && result.rxnavResponse && (
                           <div className="text-xs text-red-600">
                             Empty response - RxCUI not found in RxNav
