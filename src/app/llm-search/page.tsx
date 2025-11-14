@@ -345,6 +345,7 @@ export default function LLMSearchPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<MedicationResult[]>([]);
+  const [llmResponse, setLlmResponse] = useState<Record<string, unknown> | null>(null);
 
   const fetchRxNavData = async (rxcui: string) => {
     try {
@@ -381,7 +382,15 @@ export default function LLMSearchPage() {
       }
 
       if (statusResponse.ok) {
-        statusData = await statusResponse.json();
+        try {
+          statusData = await statusResponse.json();
+        } catch (e) {
+          console.warn('Failed to parse status response:', e);
+          statusData = { error: 'Failed to parse response' };
+        }
+      } else {
+        // Store error info even if request failed
+        statusData = { error: `HTTP ${statusResponse.status}: ${statusResponse.statusText}` };
       }
 
       if (!propertiesResponse.ok) {
@@ -476,6 +485,7 @@ export default function LLMSearchPage() {
     setLoading(true);
     setError(null);
     setResults([]);
+    setLlmResponse(null);
 
     try {
       // Generate prompt with the count
@@ -494,6 +504,10 @@ export default function LLMSearchPage() {
       }
 
       const geminiData = await geminiResponse.json();
+      
+      // Store the LLM response
+      setLlmResponse(geminiData);
+      
       const medications: Medication[] = geminiData.medications || [];
 
       if (medications.length === 0) {
@@ -809,23 +823,27 @@ export default function LLMSearchPage() {
                           {result.rxnavResponse && (
                             <details className="text-xs">
                               <summary className="cursor-pointer text-gray-600 hover:text-gray-900">
-                                View Properties API Response
+                                View Properties API Response (properties.json)
                               </summary>
                               <pre className="mt-2 max-h-40 overflow-auto rounded bg-gray-50 p-2 text-[10px]">
                                 {JSON.stringify(result.rxnavResponse, null, 2)}
                               </pre>
                             </details>
                           )}
-                          {result.rxnavStatusResponse && (
-                            <details className="text-xs">
-                              <summary className="cursor-pointer text-gray-600 hover:text-gray-900">
-                                View Status API Response
-                              </summary>
+                          <details className="text-xs">
+                            <summary className="cursor-pointer text-gray-600 hover:text-gray-900">
+                              View Status API Response (status.json)
+                            </summary>
+                            {result.rxnavStatusResponse ? (
                               <pre className="mt-2 max-h-40 overflow-auto rounded bg-gray-50 p-2 text-[10px]">
                                 {JSON.stringify(result.rxnavStatusResponse, null, 2)}
                               </pre>
-                            </details>
-                          )}
+                            ) : (
+                              <div className="mt-2 text-xs text-gray-500 italic p-2">
+                                Status API response not available
+                              </div>
+                            )}
+                          </details>
                         </div>
                         {!result.rxnavResponse?.properties && result.rxnavResponse && (
                           <div className="text-xs text-red-600">
@@ -896,6 +914,21 @@ export default function LLMSearchPage() {
           </table>
         </div>
         </>
+      )}
+
+      {/* LLM Response Display */}
+      {llmResponse && (
+        <div className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
+          <h2 className="text-lg font-semibold text-gray-900 mb-4">LLM Response</h2>
+          <details className="text-sm" open={false}>
+            <summary className="cursor-pointer text-gray-700 hover:text-gray-900 font-medium mb-2">
+              View Raw LLM Response
+            </summary>
+            <pre className="mt-2 max-h-96 overflow-auto rounded bg-gray-50 p-4 text-xs border border-gray-200">
+              {JSON.stringify(llmResponse, null, 2)}
+            </pre>
+          </details>
+        </div>
       )}
     </div>
   );
