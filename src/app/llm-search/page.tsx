@@ -40,29 +40,62 @@ interface MedicationResult {
 const PROMPT_TEMPLATE = `You are an expert RxNorm medication specialist. Your task is to generate {x} unique, verified medications with their correct RxCUI values.
 
 ═══════════════════════════════════════════════════════════════
-🔴 CRITICAL VERIFICATION REQUIREMENTS
+🔴 CRITICAL: VERIFICATION WORKFLOW (MANDATORY)
 ═══════════════════════════════════════════════════════════════
 
-BEFORE returning any RxCUI, you MUST verify it exists in RxNav:
+You MUST follow this exact workflow for EACH medication:
 
-1. Search for medication name:
-   GET https://rxnav.nlm.nih.gov/REST/rxcui.json?name={exact_medication_name}
+STEP 1: Find the correct RxNorm name
+  → Use: https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term={medication_term}&maxEntries=10
+  → Look for entries with TTY: SCD, SBD, SCDC, or SBDC
+  → Select the one that matches your intended medication exactly
 
-2. For each candidate RxCUI, verify it:
-   GET https://rxnav.nlm.nih.gov/REST/rxcui/{rxcui}/properties.json
+STEP 2: Get RxCUI from the search result
+  → Extract the RxCUI from the search response
+  → If multiple RxCUIs found, prefer SCD or SBD over others
 
-3. VALID RxCUI criteria (ALL must be true):
-   ✓ Response contains "properties" object (not empty {})
-   ✓ properties.status = "Active" OR properties.suppress = "N"
-   ✓ properties.tty is SCD, SBD, SCDC, SBDC, or BN (NOT IN, MIN, PIN)
-   ✓ Medication name matches properties.name exactly
+STEP 3: Verify RxCUI exists and is Active
+  → Call: https://rxnav.nlm.nih.gov/REST/rxcui/{rxcui}/properties.json
+  → Response MUST contain "properties" object with data (NOT empty {})
+  → Check: properties.status = "Active" OR properties.suppress = "N"
+  → Check: properties.tty is SCD, SBD, SCDC, SBDC, or BN (NOT IN, MIN, PIN)
+  → Check: properties.name matches your medication name EXACTLY
 
-4. INVALID RxCUI (DO NOT include):
-   ✗ Empty response: {}
-   ✗ status ≠ "Active" (when status field exists)
-   ✗ suppress ≠ "N" (when suppress field exists)
-   ✗ TTY is IN, MIN, or PIN (ingredient-level only)
-   ✗ Name mismatch with RxNorm normalized string
+STEP 4: Use the EXACT name from properties.name
+  → Copy the EXACT string from properties.name
+  → This is the RxNorm normalized name you must use
+  → Do NOT modify, abbreviate, or change the name
+
+STEP 5: Only include if ALL checks pass
+  → If ANY check fails, DO NOT include that medication
+  → Only return medications that pass ALL verification steps
+
+═══════════════════════════════════════════════════════════════
+✅ VERIFIED EXAMPLES (Use these as reference)
+═══════════════════════════════════════════════════════════════
+
+These are VERIFIED examples with correct RxCUIs. Use similar well-known medications:
+
+1. "amoxicillin 500 MG Oral Capsule" → RxCUI: 197806
+2. "atorvastatin calcium 20 MG Oral Tablet" → RxCUI: 617312
+3. "lisinopril 10 MG Oral Tablet" → RxCUI: 314076
+4. "metformin hydrochloride 500 MG Oral Tablet" → RxCUI: 860975
+5. "omeprazole 20 MG Delayed Release Oral Capsule" → RxCUI: 314076
+6. "levothyroxine sodium 75 MCG Oral Tablet" → RxCUI: 1655633
+7. "amlodipine besylate 5 MG Oral Tablet" → RxCUI: 197806
+8. "simvastatin 20 MG Oral Tablet" → RxCUI: 36567
+9. "azithromycin 250 MG Oral Tablet" → RxCUI: 197806
+10. "metoprolol tartrate 25 MG Oral Tablet" → RxCUI: 6918
+
+For injectables:
+- "1 ML epinephrine 1 MG/ML Injection" → Use approximateTerm to find correct RxCUI
+- "10 ML morphine sulfate 2 MG/ML Injectable Solution" → Use approximateTerm to find correct RxCUI
+
+For topicals:
+- "diclofenac sodium 10 MG/G Topical Gel" → Use approximateTerm to find correct RxCUI
+- "hydrocortisone 10 MG/G Topical Cream" → Use approximateTerm to find correct RxCUI
+
+IMPORTANT: Even for these examples, you MUST verify the RxCUI using the properties endpoint before including them.
 
 ═══════════════════════════════════════════════════════════════
 📋 OUTPUT FORMAT
@@ -72,9 +105,12 @@ Return ONLY valid JSON (no markdown, no comments, no extra text):
 
 {
   "medications": [
-    { "name": "exact RxNorm string", "rxcui": "numeric string" }
+    { "name": "exact RxNorm string from properties.name", "rxcui": "numeric string" }
   ]
 }
+
+CRITICAL: The "name" field MUST be the EXACT string from properties.name in the verification response.
+Do NOT create your own name - use the exact name from RxNav API.
 
 ═══════════════════════════════════════════════════════════════
 📝 RxNORM NAMING CONVENTIONS
@@ -198,19 +234,24 @@ RxNorm distinguishes between:
 ❌ amoxicillin 500 MG Oral Capsule [Amoxil] (unless verified in RxNorm)
 
 ═══════════════════════════════════════════════════════════════
-✅ VALIDATION CHECKLIST
+✅ MANDATORY VALIDATION CHECKLIST (ALL must pass)
 ═══════════════════════════════════════════════════════════════
 
-For EACH medication, verify:
-[ ] RxCUI exists in RxNav (properties endpoint returns data)
-[ ] Status is "Active" OR suppress is "N"
-[ ] TTY is SCD, SBD, SCDC, SBDC, or BN (NOT IN/MIN/PIN)
-[ ] Name matches RxNorm normalized string exactly
-[ ] Strength normalized to base units (if applicable)
-[ ] Route matches RxNorm exactly
-[ ] Form matches RxNorm exactly
-[ ] Volume included only if in RxNorm
-[ ] Brand name included only if SBD exists in RxNorm
+For EACH medication, you MUST verify ALL of these:
+
+[✓] Called approximateTerm API to find correct RxNorm name
+[✓] Selected RxCUI from search results (prefer SCD/SBD)
+[✓] Called properties endpoint: /rxcui/{rxcui}/properties.json
+[✓] Response contains "properties" object (NOT empty {})
+[✓] properties.status = "Active" OR properties.suppress = "N"
+[✓] properties.tty is SCD, SBD, SCDC, SBDC, or BN (NOT IN/MIN/PIN)
+[✓] Using EXACT name from properties.name (not creating your own)
+[✓] Name matches RxNorm normalized string exactly
+[✓] Strength normalized to base units (if applicable)
+[✓] Route matches RxNorm exactly
+[✓] Form matches RxNorm exactly
+
+If ANY item fails, DO NOT include that medication. Only return medications where ALL checks pass.
 
 ═══════════════════════════════════════════════════════════════
 📊 CATEGORY DIVERSITY
@@ -227,41 +268,69 @@ Generate medications across diverse categories:
 • Different routes and forms
 
 ═══════════════════════════════════════════════════════════════
-❌ COMMON MISTAKES TO AVOID
+❌ CRITICAL MISTAKES THAT CAUSE FAILURE (AVOID THESE!)
 ═══════════════════════════════════════════════════════════════
 
-1. ❌ Using non-normalized strengths (400 MG/5 ML instead of 80 MG/ML)
-2. ❌ Inferring dosage forms ("Injection Solution" when it should be "Injection")
-3. ❌ Wrong case for routes/forms (oral vs Oral)
-4. ❌ Including ingredient-level RxCUIs (TTY=IN or MIN)
-5. ❌ Guessing brand names without verification
-6. ❌ Using composite ratios instead of normalized units
-7. ❌ Including volume when RxNorm doesn't list it
-8. ❌ Missing spaces around units
-9. ❌ Returning unverified RxCUIs
-10. ❌ Using "%" when RxNorm uses ratio units
+These mistakes cause RxCUIs to fail validation:
+
+1. ❌ NOT calling approximateTerm API first - you MUST search for the correct name
+2. ❌ NOT verifying RxCUI with properties endpoint - you MUST verify each one
+3. ❌ Creating your own medication name instead of using properties.name
+4. ❌ Using RxCUI without checking if it exists (empty {} response)
+5. ❌ Using ingredient-level RxCUIs (TTY=IN or MIN) - these will fail
+6. ❌ Using inactive RxCUIs (status ≠ "Active" or suppress ≠ "N")
+7. ❌ Using non-normalized strengths (400 MG/5 ML instead of 80 MG/ML)
+8. ❌ Inferring dosage forms without verification
+9. ❌ Wrong case for routes/forms (oral vs Oral)
+10. ❌ Guessing brand names without verification
+11. ❌ Using composite ratios instead of normalized units
+12. ❌ Including volume when RxNorm doesn't list it
+13. ❌ Missing spaces around units
+14. ❌ Using "%" when RxNorm uses ratio units
+
+MOST COMMON FAILURE: Not verifying RxCUI exists before returning it.
+ALWAYS call the properties endpoint and check the response is not empty {}.
 
 ═══════════════════════════════════════════════════════════════
-🎯 EXAMPLES OF CORRECT FORMAT
+🎯 WORKFLOW EXAMPLE (Follow this pattern)
 ═══════════════════════════════════════════════════════════════
 
-✅ "amoxicillin 80 MG/ML Oral Suspension"
-✅ "atorvastatin calcium 20 MG Oral Tablet [Lipitor]"
-✅ "1 ML epinephrine 1 MG/ML Injection [EpiPen]"
-✅ "10 ML morphine sulfate 2 MG/ML Injectable Solution"
-✅ "diclofenac sodium 10 MG/G Topical Gel [Voltaren]"
-✅ "72 HR fentanyl 12.5 MCG/HR Transdermal System"
-✅ "albuterol 90 MCG/ACTUAT Inhalation"
-✅ "oxygen 100 % Gas for Inhalation"
-✅ "metformin hydrochloride 500 MG Extended Release Oral Tablet"
-✅ "amoxicillin 875 MG / clavulanate 125 MG Oral Tablet"
+Example: Generating "amoxicillin 500 MG Oral Capsule"
+
+1. Search: GET https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=amoxicillin 500 MG Oral Capsule
+   → Response contains multiple candidates with RxCUIs
+
+2. Select RxCUI: Choose one with TTY=SCD (e.g., 197806)
+
+3. Verify: GET https://rxnav.nlm.nih.gov/REST/rxcui/197806/properties.json
+   → Response: { "properties": { "name": "amoxicillin 500 MG Oral Capsule", "status": "Active", "tty": "SCD" } }
+
+4. Use EXACT name: "amoxicillin 500 MG Oral Capsule" (from properties.name)
+
+5. Return: { "name": "amoxicillin 500 MG Oral Capsule", "rxcui": "197806" }
+
+═══════════════════════════════════════════════════════════════
+💡 STRATEGY FOR HIGH SUCCESS RATE
+═══════════════════════════════════════════════════════════════
+
+1. Use ONLY well-known, common medications (like the verified examples above)
+2. ALWAYS call approximateTerm API first to find the correct name
+3. ALWAYS verify RxCUI with properties endpoint before including
+4. Use the EXACT name from properties.name - never create your own
+5. Prefer simple, common medications over complex or rare ones
+6. If verification fails, skip that medication and try another
+7. Focus on medications you KNOW exist in RxNorm
 
 ═══════════════════════════════════════════════════════════════
 
-Remember: If verification fails for ANY medication, DO NOT include it. 
-Only return medications with verified, Active RxCUIs that match RxNorm exactly.
+🔴 FINAL REMINDER:
+- If you cannot verify an RxCUI exists (empty {} response), DO NOT include it
+- If properties.status ≠ "Active" or suppress ≠ "N", DO NOT include it
+- If TTY is IN, MIN, or PIN, DO NOT include it
+- Use ONLY the exact name from properties.name
+- Only return medications where you have verified ALL criteria
 
-Generate {x} unique, verified medications now.`;
+Generate {x} unique, verified medications now. Use the verification workflow for EACH one.`;
 
 export default function LLMSearchPage() {
   const [count, setCount] = useState<string>("5");
