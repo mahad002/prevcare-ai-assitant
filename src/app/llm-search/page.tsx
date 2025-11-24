@@ -45,65 +45,72 @@ interface MedicationResult {
   loading: boolean;
 }
 
-const PROMPT_TEMPLATE = `You are an expert RxNorm medication specialist. Your task is to generate {x} unique, verified medications with their correct RxCUI values.
+const PROMPT_TEMPLATE = `You are an expert RxNorm medication specialist and clinical pharmacist. Your task is to generate {x} unique, verified medications with their correct RxCUI values using the RRF (RxNorm) database.{condition_context}
+
+{condition_instructions}
 
 ═══════════════════════════════════════════════════════════════
-🔴 CRITICAL: VERIFICATION WORKFLOW (MANDATORY)
+🔴 CRITICAL: VERIFICATION WORKFLOW USING FUNCTION CALLING
 ═══════════════════════════════════════════════════════════════
 
-You MUST follow this exact workflow for EACH medication:
+You have access to two functions that verify medications against the RRF file:
 
-STEP 1: Find the correct RxNorm name
-  → Use: https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term={medication_term}&maxEntries=10
-  → Look for entries with TTY: SCD, SBD, SCDC, or SBDC
-  → Select the one that matches your intended medication exactly
+1. **search_rrf_medications(searchTerm)**: Search for medications by name in the RRF database
+   - Use this to find accurate medication names and their RxCUIs
+   - Returns matches with rxcui, name, tty, route, form, and other details
+   - Prefer matches with TTY: SCD, SBD, SCDC, or SBDC
 
-STEP 2: Get RxCUI from the search result
-  → Extract the RxCUI from the search response
-  → If multiple RxCUIs found, prefer SCD or SBD over others
+2. **verify_rxcui_in_rrf(rxcui)**: Verify if an RxCUI exists in the RRF database
+   - Use this to confirm that a medication RxCUI is valid
+   - Returns the exact medication name from RRF if it exists
+   - Check that exists=true and preferredName is available
 
-STEP 3: Verify RxCUI exists and is Active
-  → Call: https://rxnav.nlm.nih.gov/REST/rxcui/{rxcui}/properties.json
-  → Response MUST contain "properties" object with data (NOT empty {})
-  → Check: properties.status = "Active" OR properties.suppress = "N"
-  → Check: properties.tty is SCD, SBD, SCDC, SBDC, or BN (NOT IN, MIN, PIN)
-  → Check: properties.name matches your medication name EXACTLY
+EFFICIENT WORKFLOW FOR GENERATING {x} MEDICATIONS:
 
-STEP 4: Use the EXACT name from properties.name
-  → Copy the EXACT string from properties.name
-  → This is the RxNorm normalized name you must use
-  → Do NOT modify, abbreviate, or change the name
+IMPORTANT: You have enough iterations to verify all medications. Work systematically:
 
-STEP 5: Only include if ALL checks pass
-  → If ANY check fails, DO NOT include that medication
-  → Only return medications that pass ALL verification steps
+1. **Batch Search Strategy**: 
+   - Start by searching for common medications (e.g., "amoxicillin", "atorvastatin", "lisinopril")
+   - For each search, review ALL matches and identify multiple valid RxCUIs
+   - You can verify multiple RxCUIs from a single search result
+
+2. **For Each Medication**:
+   STEP 1: Search using search_rrf_medications() with a medication term
+   STEP 2: Select the best match (prefer TTY: SCD, SBD, SCDC, or SBDC)
+   STEP 3: Verify the RxCUI using verify_rxcui_in_rrf()
+   STEP 4: If verified (exists=true), use the preferredName exactly
+   STEP 5: If verification fails, try the next match from search results or search for a different medication
+
+3. **Efficiency Tips**:
+   - You can verify multiple RxCUIs from one search result
+   - If a search returns 5 matches, verify the top 2-3 to find valid ones
+   - Don't re-search for similar medications - use different search terms
+   - Work through categories: antibiotics, statins, ACE inhibitors, etc.
+
+4. **Final Output**:
+   - Only include medications where verify_rxcui_in_rrf returned exists=true
+   - Use ONLY the exact preferredName from verification
+   - Generate exactly {x} unique, verified medications
 
 ═══════════════════════════════════════════════════════════════
-✅ VERIFIED EXAMPLES (Use these as reference)
+✅ EXAMPLE MEDICATIONS TO GENERATE
 ═══════════════════════════════════════════════════════════════
 
-These are VERIFIED examples with correct RxCUIs. Use similar well-known medications:
+{medication_selection_instructions}
 
-1. "amoxicillin 500 MG Oral Capsule" → RxCUI: 197806
-2. "atorvastatin calcium 20 MG Oral Tablet" → RxCUI: 617312
-3. "lisinopril 10 MG Oral Tablet" → RxCUI: 314076
-4. "metformin hydrochloride 500 MG Oral Tablet" → RxCUI: 860975
-5. "omeprazole 20 MG Delayed Release Oral Capsule" → RxCUI: 314076
-6. "levothyroxine sodium 75 MCG Oral Tablet" → RxCUI: 1655633
-7. "amlodipine besylate 5 MG Oral Tablet" → RxCUI: 197806
-8. "simvastatin 20 MG Oral Tablet" → RxCUI: 36567
-9. "azithromycin 250 MG Oral Tablet" → RxCUI: 197806
-10. "metoprolol tartrate 25 MG Oral Tablet" → RxCUI: 6918
+Examples of search terms to try:
+- "amoxicillin 500 MG"
+- "atorvastatin 20 MG"
+- "lisinopril 10 MG"
+- "metformin 500 MG"
+- "epinephrine 1 MG/ML"
+- "diclofenac 10 MG/G"
+- "fentanyl 12.5 MCG/HR"
+- "ibuprofen 200 MG"
+- "acetaminophen 500 MG"
+- "omeprazole 20 MG"
 
-For injectables:
-- "1 ML epinephrine 1 MG/ML Injection" → Use approximateTerm to find correct RxCUI
-- "10 ML morphine sulfate 2 MG/ML Injectable Solution" → Use approximateTerm to find correct RxCUI
-
-For topicals:
-- "diclofenac sodium 10 MG/G Topical Gel" → Use approximateTerm to find correct RxCUI
-- "hydrocortisone 10 MG/G Topical Cream" → Use approximateTerm to find correct RxCUI
-
-IMPORTANT: Even for these examples, you MUST verify the RxCUI using the properties endpoint before including them.
+IMPORTANT: You MUST verify each medication using the functions before including it.
 
 ═══════════════════════════════════════════════════════════════
 📋 OUTPUT FORMAT
@@ -117,8 +124,8 @@ Return ONLY valid JSON (no markdown, no comments, no extra text):
   ]
 }
 
-CRITICAL: The "name" field MUST be the EXACT string from properties.name in the verification response.
-Do NOT create your own name - use the exact name from RxNav API.
+CRITICAL: The "name" field MUST be the EXACT string from preferredName in the verify_rxcui_in_rrf() response.
+Do NOT create your own name - use the exact name from RRF database.
 
 ═══════════════════════════════════════════════════════════════
 📝 RxNORM NAMING CONVENTIONS
@@ -247,17 +254,13 @@ RxNorm distinguishes between:
 
 For EACH medication, you MUST verify ALL of these:
 
-[✓] Called approximateTerm API to find correct RxNorm name
-[✓] Selected RxCUI from search results (prefer SCD/SBD)
-[✓] Called properties endpoint: /rxcui/{rxcui}/properties.json
-[✓] Response contains "properties" object (NOT empty {})
-[✓] properties.status = "Active" OR properties.suppress = "N"
-[✓] properties.tty is SCD, SBD, SCDC, SBDC, or BN (NOT IN/MIN/PIN)
-[✓] Using EXACT name from properties.name (not creating your own)
-[✓] Name matches RxNorm normalized string exactly
-[✓] Strength normalized to base units (if applicable)
-[✓] Route matches RxNorm exactly
-[✓] Form matches RxNorm exactly
+[✓] Called search_rrf_medications() to find the medication
+[✓] Selected RxCUI from search results (prefer SCD/SBD/SCDC/SBDC TTY)
+[✓] Called verify_rxcui_in_rrf() with the RxCUI
+[✓] Verification response shows exists=true
+[✓] Using EXACT name from preferredName in verification response
+[✓] Do NOT create your own name - use the exact name from RRF
+[✓] Medication has valid TTY (SCD, SBD, SCDC, SBDC preferred)
 
 If ANY item fails, DO NOT include that medication. Only return medications where ALL checks pass.
 
@@ -281,23 +284,16 @@ Generate medications across diverse categories:
 
 These mistakes cause RxCUIs to fail validation:
 
-1. ❌ NOT calling approximateTerm API first - you MUST search for the correct name
-2. ❌ NOT verifying RxCUI with properties endpoint - you MUST verify each one
-3. ❌ Creating your own medication name instead of using properties.name
-4. ❌ Using RxCUI without checking if it exists (empty {} response)
-5. ❌ Using ingredient-level RxCUIs (TTY=IN or MIN) - these will fail
-6. ❌ Using inactive RxCUIs (status ≠ "Active" or suppress ≠ "N")
-7. ❌ Using non-normalized strengths (400 MG/5 ML instead of 80 MG/ML)
-8. ❌ Inferring dosage forms without verification
-9. ❌ Wrong case for routes/forms (oral vs Oral)
-10. ❌ Guessing brand names without verification
-11. ❌ Using composite ratios instead of normalized units
-12. ❌ Including volume when RxNorm doesn't list it
-13. ❌ Missing spaces around units
-14. ❌ Using "%" when RxNorm uses ratio units
+1. ❌ NOT calling search_rrf_medications() first - you MUST search for the correct name
+2. ❌ NOT calling verify_rxcui_in_rrf() - you MUST verify each RxCUI exists
+3. ❌ Creating your own medication name instead of using preferredName from verification
+4. ❌ Using RxCUI without verifying it exists (exists=false in response)
+5. ❌ Using ingredient-level RxCUIs (TTY=IN or MIN) - prefer SCD/SBD/SCDC/SBDC
+6. ❌ Not using the exact name from preferredName in verification response
+7. ❌ Skipping verification steps - you MUST verify every medication
 
-MOST COMMON FAILURE: Not verifying RxCUI exists before returning it.
-ALWAYS call the properties endpoint and check the response is not empty {}.
+MOST COMMON FAILURE: Not verifying RxCUI exists in RRF before returning it.
+ALWAYS call verify_rxcui_in_rrf() and check that exists=true.
 
 ═══════════════════════════════════════════════════════════════
 🎯 WORKFLOW EXAMPLE (Follow this pattern)
@@ -305,43 +301,43 @@ ALWAYS call the properties endpoint and check the response is not empty {}.
 
 Example: Generating "amoxicillin 500 MG Oral Capsule"
 
-1. Search: GET https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=amoxicillin 500 MG Oral Capsule
-   → Response contains multiple candidates with RxCUIs
+1. Search: Call search_rrf_medications("amoxicillin 500 MG")
+   → Response contains matches with RxCUIs and names
+   → Select match with TTY=SCD and RxCUI (e.g., "197806")
 
-2. Select RxCUI: Choose one with TTY=SCD (e.g., 197806)
+2. Verify: Call verify_rxcui_in_rrf("197806")
+   → Response: { "exists": true, "preferredName": "amoxicillin 500 MG Oral Capsule", ... }
 
-3. Verify: GET https://rxnav.nlm.nih.gov/REST/rxcui/197806/properties.json
-   → Response: { "properties": { "name": "amoxicillin 500 MG Oral Capsule", "status": "Active", "tty": "SCD" } }
+3. Use EXACT name: "amoxicillin 500 MG Oral Capsule" (from preferredName)
 
-4. Use EXACT name: "amoxicillin 500 MG Oral Capsule" (from properties.name)
-
-5. Return: { "name": "amoxicillin 500 MG Oral Capsule", "rxcui": "197806" }
+4. Return: { "name": "amoxicillin 500 MG Oral Capsule", "rxcui": "197806" }
 
 ═══════════════════════════════════════════════════════════════
 💡 STRATEGY FOR HIGH SUCCESS RATE
 ═══════════════════════════════════════════════════════════════
 
-1. Use ONLY well-known, common medications (like the verified examples above)
-2. ALWAYS call approximateTerm API first to find the correct name
-3. ALWAYS verify RxCUI with properties endpoint before including
-4. Use the EXACT name from properties.name - never create your own
-5. Prefer simple, common medications over complex or rare ones
-6. If verification fails, skip that medication and try another
-7. Focus on medications you KNOW exist in RxNorm
+1. Use well-known, common medications across diverse categories
+2. ALWAYS call search_rrf_medications() first to find the correct name and RxCUI
+3. ALWAYS call verify_rxcui_in_rrf() to confirm the RxCUI exists in RRF
+4. Use the EXACT name from preferredName in verification response - never create your own
+5. Prefer medications with TTY: SCD, SBD, SCDC, or SBDC
+6. If verification fails (exists=false), skip that medication and try another
+7. Generate diverse medications: oral, injectable, topical, inhalation, etc.
 
 ═══════════════════════════════════════════════════════════════
 
 🔴 FINAL REMINDER:
-- If you cannot verify an RxCUI exists (empty {} response), DO NOT include it
-- If properties.status ≠ "Active" or suppress ≠ "N", DO NOT include it
-- If TTY is IN, MIN, or PIN, DO NOT include it
-- Use ONLY the exact name from properties.name
-- Only return medications where you have verified ALL criteria
+- You MUST verify each medication using the functions before including it
+- If exists=false in verification, skip that medication and try another
+- Use ONLY the exact name from preferredName in verification response
+- Generate exactly {x} unique medications - you have enough iterations to complete this
+- Work efficiently: one search can yield multiple valid medications to verify
 
-Generate {x} unique, verified medications now. Use the verification workflow for EACH one.`;
+Generate {x} unique, verified medications now. Work systematically through the categories.`;
 
 export default function LLMSearchPage() {
   const [count, setCount] = useState<string>("5");
+  const [condition, setCondition] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<MedicationResult[]>([]);
@@ -488,14 +484,93 @@ export default function LLMSearchPage() {
     setLlmResponse(null);
 
     try {
-      // Generate prompt with the count
-      const prompt = PROMPT_TEMPLATE.replace(/{x}/g, num.toString());
+      // Build condition-specific context
+      const conditionContext = condition.trim() 
+        ? `\n\n🎯 CLINICAL CONTEXT: Generate medications specifically for treating: "${condition.trim()}"\n` 
+        : "";
+      
+      const conditionInstructions = condition.trim()
+        ? `\n═══════════════════════════════════════════════════════════════
+🎯 CONDITION-SPECIFIC MEDICATION SELECTION
+═══════════════════════════════════════════════════════════════
 
-      // Call Gemini API
+You are generating medications to treat: "${condition.trim()}"
+
+IMPORTANT GUIDELINES:
+- Generate medications that are clinically appropriate for this condition
+- Include both prescription and OTC medications as appropriate
+- Consider different medication classes that treat this condition
+- Include various formulations (oral, topical, injectable) as clinically relevant
+- Ensure medications are commonly used and effective for this specific condition
+- If the condition requires specific medication types (e.g., pain relievers for headache, antacids for stomach ache), prioritize those
+
+Examples for "${condition.trim()}":
+- Search for medications commonly prescribed or recommended for this condition
+- Include first-line treatments and alternatives
+- Consider different strengths and formulations as appropriate
+- Verify each medication exists in RRF before including it
+
+`
+        : `\n═══════════════════════════════════════════════════════════════
+✅ MEDICATION SELECTION GUIDELINES
+═══════════════════════════════════════════════════════════════
+
+Generate diverse medications across these categories. For EACH one, you MUST:
+1. Call search_rrf_medications() to find it
+2. Call verify_rxcui_in_rrf() to confirm it exists
+3. Use the exact name from the verification response
+
+Categories to include:
+- Common prescription drugs (antibiotics, statins, ACE inhibitors, etc.)
+- OTC medications
+- Injectables (Injection, Injectable Solution)
+- Inhalation products (inhalers, gases)
+- Topicals (creams, gels, ointments)
+- Transdermal systems
+- Vitamins and supplements
+
+`;
+
+      // Generate prompt with the count and condition
+      let prompt = PROMPT_TEMPLATE
+        .replace(/{x}/g, num.toString())
+        .replace(/{condition_context}/g, conditionContext)
+        .replace(/{condition_instructions}/g, conditionInstructions)
+        .replace(/{medication_selection_instructions}/g, condition.trim() 
+          ? `Generate medications specifically appropriate for treating "${condition.trim()}". For EACH one, you MUST:
+1. Call search_rrf_medications() to find medications relevant to this condition
+2. Call verify_rxcui_in_rrf() to confirm it exists
+3. Use the exact name from the verification response
+
+Focus on medications that are:
+- Clinically indicated for ${condition.trim()}
+- Commonly prescribed or recommended for this condition
+- Available in appropriate formulations (oral, topical, injectable, etc.)
+- Include both prescription and OTC options as appropriate`
+          : `Generate diverse medications across these categories. For EACH one, you MUST:
+1. Call search_rrf_medications() to find it
+2. Call verify_rxcui_in_rrf() to confirm it exists
+3. Use the exact name from the verification response
+
+Categories to include:
+- Common prescription drugs (antibiotics, statins, ACE inhibitors, etc.)
+- OTC medications
+- Injectables (Injection, Injectable Solution)
+- Inhalation products (inhalers, gases)
+- Topicals (creams, gels, ointments)
+- Transdermal systems
+- Vitamins and supplements`);
+
+      // Call Gemini API with function calling enabled
       const geminiResponse = await fetch("/api/gemini", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ 
+          prompt,
+          useFunctionCalling: true,
+          // Models that support function calling: gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite, gemini-2.0-flash
+          models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+        }),
       });
 
       if (!geminiResponse.ok) {
@@ -562,12 +637,17 @@ export default function LLMSearchPage() {
     setCount(event.target.value);
   };
 
+  const handleConditionChange = (event: ChangeEvent<HTMLInputElement>) => {
+    setCondition(event.target.value);
+  };
+
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-6 p-6">
       <header className="flex flex-col gap-2">
         <h1 className="text-3xl font-semibold">LLM Medication Search</h1>
         <p className="text-sm text-gray-600">
-          Generate medications using LLM and validate them against RxNav API and RXNCONSO.RRF file.
+          Generate medications using LLM and validate them against RxNav API and RXNCONSO.RRF file. 
+          Optionally specify a condition or symptom to generate clinically relevant medications.
         </p>
         <div className="mt-2 rounded-lg border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800">
           <p className="font-medium mb-1">Verification Notes:</p>
@@ -580,31 +660,54 @@ export default function LLMSearchPage() {
       </header>
 
       <form onSubmit={handleSubmit} className="flex flex-col gap-4 rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
-        <div className="flex flex-col gap-2 md:flex-row md:items-end">
-          <div className="flex flex-1 flex-col gap-1">
-            <label htmlFor="count" className="text-sm font-medium text-gray-700">
-              Number of medications to generate (1-100)
+        <div className="flex flex-col gap-4">
+          {/* Condition/Symptom Input */}
+          <div className="flex flex-col gap-1">
+            <label htmlFor="condition" className="text-sm font-medium text-gray-700">
+              Condition or Symptom (Optional)
             </label>
             <input
-              id="count"
-              name="count"
-              type="number"
-              min="1"
-              max="100"
-              value={count}
-              onChange={handleCountChange}
+              id="condition"
+              name="condition"
+              type="text"
+              value={condition}
+              onChange={handleConditionChange}
               className="w-full rounded border border-gray-300 px-3 py-2 text-sm shadow-sm focus:border-gray-500 focus:outline-none focus:ring-2 focus:ring-gray-200"
-              placeholder="Enter number"
+              placeholder="e.g., headache, stomach ache, fever, high blood pressure, diabetes"
               disabled={loading}
             />
+            <p className="text-xs text-gray-500">
+              Specify a condition or symptom to generate clinically relevant medications. Leave empty for diverse medications.
+            </p>
           </div>
-          <button
-            type="submit"
-            className="inline-flex items-center justify-center rounded bg-blue-600 px-6 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-blue-700 disabled:opacity-50"
-            disabled={loading}
-          >
-            {loading ? "Generating..." : "Generate & Validate"}
-          </button>
+
+          {/* Count and Submit */}
+          <div className="flex flex-col gap-2 md:flex-row md:items-end">
+            <div className="flex flex-1 flex-col gap-1">
+              <label htmlFor="count" className="text-sm font-medium text-gray-700">
+                Number of medications to generate (1-100)
+              </label>
+              <input
+                id="count"
+                name="count"
+                type="number"
+                min="1"
+                max="100"
+                value={count}
+                onChange={handleCountChange}
+                className="w-full rounded border border-gray-300 px-3 py-2 text-sm shadow-sm focus:border-gray-500 focus:outline-none focus:ring-2 focus:ring-gray-200"
+                placeholder="Enter number"
+                disabled={loading}
+              />
+            </div>
+            <button
+              type="submit"
+              className="inline-flex items-center justify-center rounded bg-blue-600 px-6 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-blue-700 disabled:opacity-50"
+              disabled={loading}
+            >
+              {loading ? "Generating..." : "Generate & Validate"}
+            </button>
+          </div>
         </div>
       </form>
 
