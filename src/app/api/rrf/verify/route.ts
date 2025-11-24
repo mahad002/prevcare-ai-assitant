@@ -42,20 +42,27 @@ export async function POST(request: NextRequest) {
       await ensureCatalogLoaded();
       const matches = approximateMatch(searchTerm.trim(), 20);
 
+      const enrichedMatches = matches
+        .map((m) => {
+          const concept = conceptsCache?.find((c) => c.rxcui === m.rxcui);
+          return {
+            rxcui: m.rxcui,
+            name: m.name,
+            tty: m.tty,
+            route: concept?.route,
+            form: concept?.form,
+            ingredients: concept?.ingredients,
+            brand: concept?.brand,
+            score: m.score,
+          };
+        });
+
       return NextResponse.json({
         success: true,
         action: 'search',
         searchTerm,
-        matches: matches.map(m => ({
-          rxcui: m.rxcui,
-          name: m.name,
-          tty: m.tty,
-          route: m.route,
-          form: m.form,
-          ingredients: m.ingredients,
-          brand: m.brand
-        })),
-        count: matches.length
+        matches: enrichedMatches,
+        count: enrichedMatches.length
       });
     } else if (action === 'verify_rxcui') {
       // Verify if RxCUI exists in RRF file
