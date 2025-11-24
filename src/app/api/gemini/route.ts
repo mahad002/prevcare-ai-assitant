@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { join } from "path";
-import { readFile } from "fs/promises";
 import { loadCatalog, approximateMatch } from "@/lib/approxMatch";
 import { loadRrfFileToConcepts } from "@/lib/rrfLoader";
 
@@ -27,129 +26,71 @@ async function ensureCatalogLoaded() {
 // Function declarations for Gemini function calling
 const FUNCTION_DECLARATIONS = [
   {
-    name: "search_rrf_medications",
-    description: "Search for medications in the RRF (RxNorm) file by medication name. Use this to find accurate medication names and their RxCUIs before generating results.",
+    name: "find_rrf_verified_medications",
+    description: "Search the RRF (RxNorm) file for medications and return fully verified RxNorm entries (SCD/SBD/SCDC/SBDC) with their RxCUIs, names, and metadata.",
     parameters: {
       type: "object",
       properties: {
         searchTerm: {
           type: "string",
-          description: "The medication name or term to search for (e.g., 'amoxicillin 500 MG', 'atorvastatin', 'lisinopril 10 MG Oral Tablet')",
+          description: "Medication term to search in RxNorm (e.g., 'amoxicillin 500 MG', 'atorvastatin', 'lisinopril 10 MG Oral Tablet').",
+        },
+        limit: {
+          type: "number",
+          description: "Optional limit for number of results (default 20).",
         },
       },
       required: ["searchTerm"],
-    },
-  },
-  {
-    name: "verify_rxcui_in_rrf",
-    description: "Verify if an RxCUI exists in the RRF file and get its details. Use this to confirm that a medication RxCUI is valid and exists in the RRF database before including it in results.",
-    parameters: {
-      type: "object",
-      properties: {
-        rxcui: {
-          type: "string",
-          description: "The RxCUI (RxNorm Concept Unique Identifier) to verify (e.g., '197806', '617312')",
-        },
-      },
-      required: ["rxcui"],
     },
   },
 ];
 
 // Execute function calls directly (no HTTP overhead)
 async function executeFunction(functionName: string, args: any): Promise<any> {
-  if (functionName === "search_rrf_medications") {
-    await ensureCatalogLoaded();
-    const matches = approximateMatch(args.searchTerm?.trim() || "", 20);
-    
-    // Get full concept data from cache
-    const fullMatches = matches.map((m) => {
-      const concept = conceptsCache?.find((c) => c.rxcui === m.rxcui);
-      return {
-        rxcui: m.rxcui,
-        name: m.name,
-        tty: m.tty,
-        score: m.score,
-        route: concept?.route,
-        form: concept?.form,
-        ingredients: concept?.ingredients,
-        brand: concept?.brand,
-      };
-    });
-    
-    return {
-      success: true,
-      action: "search",
-      searchTerm: args.searchTerm,
-      matches: fullMatches,
-      count: matches.length,
-    };
-  } else if (functionName === "verify_rxcui_in_rrf") {
-    const rxcui = String(args.rxcui || "").trim();
-    if (!rxcui) {
-      return {
-        success: false,
-        error: "rxcui is required",
-        exists: false,
-      };
-    }
-
-    const rrfPath = join(process.cwd(), "public", "rrf", "RXNCONSO.RRF");
-    const content = await readFile(rrfPath, "utf-8");
-    const lines = content.split(/\r?\n/);
-
-    const matches: Array<{
-      rxcui: string;
-      tty: string;
-      str: string;
-      sab: string;
-    }> = [];
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const parts = line.trim().split("|");
-      if (parts.length < 15) continue;
-
-      const lineRxcui = parts[0]?.trim();
-      if (lineRxcui === rxcui) {
-        const tty = parts[12]?.trim() || "";
-        const str = parts[14]?.trim() || "";
-        const sab = parts[11]?.trim() || "";
-
-        if (sab === "RXNORM") {
-          matches.push({
-            rxcui: lineRxcui,
-            tty,
-            str,
-            sab,
-          });
-        }
-      }
-    }
-
-    const hasSU = matches.some((m) => m.tty === "SU");
-    const preferredMatches = matches.filter(
-      (m) => m.tty === "SCD" || m.tty === "SBD" || m.tty === "SCDC" || m.tty === "SBDC"
-    );
-
-    return {
-      success: true,
-      action: "verify_rxcui",
-      rxcui,
-      exists: matches.length > 0,
-      hasSU,
-      matches: preferredMatches.length > 0 ? preferredMatches : matches,
-      count: matches.length,
-      preferredName:
-        preferredMatches.length > 0
-          ? preferredMatches[0].str
-          : matches.length > 0
-          ? matches[0].str
-          : null,
-    };
-  } else {
+  if (functionName !== "find_rrf_verified_medications") {
     throw new Error(`Unknown function: ${functionName}`);
   }
+
+  await ensureCatalogLoaded();
+
+  const searchTerm = args.searchTerm?.trim() || "";
+  const limit =
+    typeof args.limit === "number" && args.limit > 0 ? Math.min(args.limit, 50) : 20;
+
+  const matches = approximateMatch(searchTerm, limit);
+
+  const results = matches
+    .map((m) => {
+      const concept = conceptsCache?.find((c) => c.rxcui === m.rxcui);
+      if (!concept) return null;
+      const preferred =
+        concept.tty === "SCD" ||
+        concept.tty === "SBD" ||
+        concept.tty === "SCDC" ||
+        concept.tty === "SBDC" ||
+        concept.tty === "BN";
+
+      return {
+        rxcui: concept.rxcui,
+        name: concept.name,
+        tty: concept.tty,
+        route: concept.route,
+        form: concept.form,
+        ingredients: concept.ingredients,
+        brand: concept.brand,
+        verified: preferred,
+        score: m.score,
+      };
+    })
+    .filter(Boolean);
+
+  return {
+    success: true,
+    action: "find_rrf_verified_medications",
+    searchTerm,
+    matches: results,
+    count: results.length,
+  };
 }
 
 export async function POST(req: Request) {
@@ -205,14 +146,13 @@ export async function POST(req: Request) {
         }
 
         let conversationHistory: any[] = [{ parts: [{ text: prompt }] }];
-        // Calculate max iterations based on prompt - estimate 2 function calls per medication
-        // Extract medication count from prompt if possible
-        const medicationCountMatch = prompt.match(/generate\s+(\d+)|{x}|(\d+)\s+unique.*medications/i);
-        const estimatedCount = medicationCountMatch 
-          ? parseInt(medicationCountMatch[1] || medicationCountMatch[2] || "5", 10)
+        // Estimate required iterations from requested medication count (more generous buffer for batching)
+        const medicationCountMatch = prompt.match(/(\d+)\s+(?:unique|verified)?\s*medications/i);
+        const estimatedCount = medicationCountMatch
+          ? parseInt(medicationCountMatch[1], 10)
           : 5;
-        // Each medication needs ~2 function calls (search + verify), add buffer
-        const maxIterations = Math.max(10, estimatedCount * 3); // At least 10, or 3x the count
+        // Allow ~4-5 function turns per medication plus extra headroom
+        const maxIterations = Math.max(20, estimatedCount * 6);
         let iteration = 0;
         let lastData: any = null; // Store last response data
 

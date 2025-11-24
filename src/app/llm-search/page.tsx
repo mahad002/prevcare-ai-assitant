@@ -45,57 +45,26 @@ interface MedicationResult {
   loading: boolean;
 }
 
-const PROMPT_TEMPLATE = `You are an expert RxNorm medication specialist and clinical pharmacist. Your task is to generate {x} unique, verified medications with their correct RxCUI values using the RRF (RxNorm) database.{condition_context}
+const PROMPT_TEMPLATE = `You are an expert RxNorm medication specialist and clinical pharmacist. Your job is to return {x} unique medications with correct RxCUIs, fully verified against the RRF (RxNorm) database.{condition_context}
 
 {condition_instructions}
 
-═══════════════════════════════════════════════════════════════
-🔴 CRITICAL: VERIFICATION WORKFLOW USING FUNCTION CALLING
-═══════════════════════════════════════════════════════════════
+TOOLS YOU CAN CALL
+- find_rrf_verified_medications(searchTerm, limit?): returns up to 20 fully verified RxNorm entries (SCD/SBD/SCDC/SBDC/BN) with their exact names, RxCUIs, routes, and forms. The "name" field is already the normalized string you must return.
 
-You have access to two functions that verify medications against the RRF file:
+MINIMAL WORKFLOW FOR {x} MEDICATIONS
+1. Plan a diverse, clinically appropriate set of medications (or the ones matched to the condition below).
 
-1. **search_rrf_medications(searchTerm)**: Search for medications by name in the RRF database
-   - Use this to find accurate medication names and their RxCUIs
-   - Returns matches with rxcui, name, tty, route, form, and other details
-   - Prefer matches with TTY: SCD, SBD, SCDC, or SBDC
+2. Call find_rrf_verified_medications() with a broad search term and capture multiple promising hits from the response. Queue them up by clinical category.
+3. Select the best entries from the queued results (only use matches where \`verified=true\`) and copy their exact \`name\` + \`rxcui\` into your final list.
+4. Only perform another search if you still need more medications after exhausting the current queue.
 
-2. **verify_rxcui_in_rrf(rxcui)**: Verify if an RxCUI exists in the RRF database
-   - Use this to confirm that a medication RxCUI is valid
-   - Returns the exact medication name from RRF if it exists
-   - Check that exists=true and preferredName is available
+EFFICIENCY REMINDERS
+- One search can yield several valid medications—exhaust those results before calling the tool again.
+- Prefer well-known RxNorm concepts to avoid ambiguous or inactive entries.
+- Stop immediately once you have {x} valid medications.
 
-EFFICIENT WORKFLOW FOR GENERATING {x} MEDICATIONS:
-
-IMPORTANT: You have enough iterations to verify all medications. Work systematically:
-
-1. **Batch Search Strategy**: 
-   - Start by searching for common medications (e.g., "amoxicillin", "atorvastatin", "lisinopril")
-   - For each search, review ALL matches and identify multiple valid RxCUIs
-   - You can verify multiple RxCUIs from a single search result
-
-2. **For Each Medication**:
-   STEP 1: Search using search_rrf_medications() with a medication term
-   STEP 2: Select the best match (prefer TTY: SCD, SBD, SCDC, or SBDC)
-   STEP 3: Verify the RxCUI using verify_rxcui_in_rrf()
-   STEP 4: If verified (exists=true), use the preferredName exactly
-   STEP 5: If verification fails, try the next match from search results or search for a different medication
-
-3. **Efficiency Tips**:
-   - You can verify multiple RxCUIs from one search result
-   - If a search returns 5 matches, verify the top 2-3 to find valid ones
-   - Don't re-search for similar medications - use different search terms
-   - Work through categories: antibiotics, statins, ACE inhibitors, etc.
-
-4. **Final Output**:
-   - Only include medications where verify_rxcui_in_rrf returned exists=true
-   - Use ONLY the exact preferredName from verification
-   - Generate exactly {x} unique, verified medications
-
-═══════════════════════════════════════════════════════════════
-✅ EXAMPLE MEDICATIONS TO GENERATE
-═══════════════════════════════════════════════════════════════
-
+CLINICAL TARGETS
 {medication_selection_instructions}
 
 Examples of search terms to try:
@@ -110,7 +79,7 @@ Examples of search terms to try:
 - "acetaminophen 500 MG"
 - "omeprazole 20 MG"
 
-IMPORTANT: You MUST verify each medication using the functions before including it.
+IMPORTANT: Only include medications taken directly from find_rrf_verified_medications() results where \`verified=true\`. Do not fabricate names or RxCUIs.
 
 ═══════════════════════════════════════════════════════════════
 📋 OUTPUT FORMAT
@@ -124,145 +93,9 @@ Return ONLY valid JSON (no markdown, no comments, no extra text):
   ]
 }
 
-CRITICAL: The "name" field MUST be the EXACT string from preferredName in the verify_rxcui_in_rrf() response.
-Do NOT create your own name - use the exact name from RRF database.
+CRITICAL: The "name" field MUST be the EXACT \`name\` returned by find_rrf_verified_medications(). Do NOT edit, abbreviate, or reformat it. Keep RxNorm strength/route/form exactly as provided.
 
-═══════════════════════════════════════════════════════════════
-📝 RxNORM NAMING CONVENTIONS
-═══════════════════════════════════════════════════════════════
-
-Structure: [volume] [ingredient(s)] [strength(s)] [modifier] [route] [form] [brand]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. INGREDIENTS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Use exact RxNorm ingredient name (base, salt, or hydrate)
-• Maintain RxNorm's ingredient order
-• Multiple ingredients: separate with " / "
-• Capitalize first letter of each ingredient word
-
-✅ amoxicillin 500 MG
-✅ amoxicillin 875 MG / clavulanate 125 MG
-✅ metformin hydrochloride 500 MG
-❌ Amoxicillin (wrong capitalization)
-❌ amoxicillin/clavulanate (missing spaces)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-2. STRENGTH & UNITS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Normalize composite ratios to base units:
-  - 400 MG/5 ML → 80 MG/ML
-  - 250 MG/5 ML → 50 MG/ML
-  - 1000 MG/10 ML → 100 MG/ML
-
-• Allowed units: MG, MG/ML, MG/G, MG/HR, UNIT/ML, %
-• Always include ONE space before unit
-• Use "%" ONLY when RxNorm explicitly lists it
-
-✅ amoxicillin 80 MG/ML
-✅ minoxidil 5 % (when RxNorm uses %)
-❌ amoxicillin 400 MG/5 ML (not normalized)
-❌ amoxicillin80MG (missing spaces)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-3. VOLUME/QUANTITY (Optional)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Include ONLY if RxNorm lists it
-• Common for: injectables, inhalers, transdermal patches
-• Format: number + space + unit
-
-✅ 1 ML epinephrine 1 MG/ML Injection
-✅ 10 ML morphine sulfate 2 MG/ML Injectable Solution
-✅ 72 HR fentanyl 12.5 MCG/HR Transdermal System
-✅ 200 ACTUAT albuterol 90 MCG/ACTUAT Inhaler
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-4. DOSAGE FORM MODIFIERS (Optional)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Include ONLY if RxNorm explicitly lists them
-• Common modifiers: Extended Release, Delayed Release, Sustained Release
-
-✅ metformin hydrochloride 500 MG Extended Release Oral Tablet
-✅ omeprazole 20 MG Delayed Release Oral Capsule
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-5. ROUTE OF ADMINISTRATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Use EXACTLY as RxNorm lists (case-sensitive)
-• Common routes: Oral, Injection, Inhalation, Topical, Transdermal, for Inhalation
-
-✅ amoxicillin 500 MG Oral Capsule
-✅ epinephrine 1 MG/ML Injection
-✅ albuterol 90 MCG/ACTUAT Inhalation
-❌ oral (wrong case)
-❌ Injectable (wrong form - use "Injection" or "Injectable Solution")
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-6. DOSAGE FORMS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Use EXACT RxNorm form (case-sensitive)
-• Common forms: Tablet, Capsule, Suspension, Solution, Cream, Gel, Ointment, 
-  Injection, Injectable Solution, Inhaler, System, Gas for Inhalation
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💉 INJECTABLES - CRITICAL RULES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RxNorm distinguishes between:
-• "Injection" = Ready-to-use, prefilled
-• "Injectable Solution" = Requires dilution/reconstitution
-
-✅ 1 ML epinephrine 1 MG/ML Injection [EpiPen]
-✅ 1 ML heparin sodium 5000 UNIT/ML Injectable Solution
-✅ 10 ML morphine sulfate 2 MG/ML Injectable Solution
-❌ heparin sodium 5000 UNIT/ML Injection (wrong - should be Injectable Solution)
-❌ epinephrine 1 MG/ML Injectable Solution (wrong - should be Injection)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🧴 TOPICALS & TRANSDERMALS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Topicals: Use ratio units (MG/G, MG/ML) unless RxNorm uses %
-• Transdermals: Include duration + rate
-
-✅ diclofenac sodium 10 MG/G Topical Gel [Voltaren]
-✅ hydrocortisone 10 MG/G Topical Cream
-✅ minoxidil 5 % Topical Solution [Rogaine] (valid - RxNorm uses %)
-✅ 72 HR fentanyl 12.5 MCG/HR Transdermal System
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🌬️ GASES FOR INHALATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Use "Gas for Inhalation" exactly
-• Include strength only if RxNorm lists it
-
-✅ oxygen 100 % Gas for Inhalation
-❌ nitrous oxide 50 % Gas for Inhalation (unless verified in RxNorm)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🏷️ BRAND NAMES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Include ONLY if RxNorm has SBD (Semantic Branded Drug) entry
-• Format: [BrandName] at the end
-• Do NOT infer or guess brand names
-
-✅ atorvastatin calcium 20 MG Oral Tablet [Lipitor]
-✅ 1 ML epinephrine 1 MG/ML Injection [EpiPen]
-❌ amoxicillin 500 MG Oral Capsule [Amoxil] (unless verified in RxNorm)
-
-═══════════════════════════════════════════════════════════════
-✅ MANDATORY VALIDATION CHECKLIST (ALL must pass)
-═══════════════════════════════════════════════════════════════
-
-For EACH medication, you MUST verify ALL of these:
-
-[✓] Called search_rrf_medications() to find the medication
-[✓] Selected RxCUI from search results (prefer SCD/SBD/SCDC/SBDC TTY)
-[✓] Called verify_rxcui_in_rrf() with the RxCUI
-[✓] Verification response shows exists=true
-[✓] Using EXACT name from preferredName in verification response
-[✓] Do NOT create your own name - use the exact name from RRF
-[✓] Medication has valid TTY (SCD, SBD, SCDC, SBDC preferred)
-
-If ANY item fails, DO NOT include that medication. Only return medications where ALL checks pass.
+Do not include any medication unless the match indicates \`verified=true\`, the TTY is SCD/SBD/SCDC/SBDC/BN, and it is not already in your list.
 
 ═══════════════════════════════════════════════════════════════
 📊 CATEGORY DIVERSITY
@@ -284,16 +117,13 @@ Generate medications across diverse categories:
 
 These mistakes cause RxCUIs to fail validation:
 
-1. ❌ NOT calling search_rrf_medications() first - you MUST search for the correct name
-2. ❌ NOT calling verify_rxcui_in_rrf() - you MUST verify each RxCUI exists
-3. ❌ Creating your own medication name instead of using preferredName from verification
-4. ❌ Using RxCUI without verifying it exists (exists=false in response)
-5. ❌ Using ingredient-level RxCUIs (TTY=IN or MIN) - prefer SCD/SBD/SCDC/SBDC
-6. ❌ Not using the exact name from preferredName in verification response
-7. ❌ Skipping verification steps - you MUST verify every medication
+1. ❌ Not calling find_rrf_verified_medications() before picking meds.
+2. ❌ Ignoring \`verified=false\` entries or selecting TTY=IN/MIN/PIN.
+3. ❌ Editing the RxNorm string instead of copying the exact \`name\`.
+4. ❌ Reusing the same RxCUI more than once.
+5. ❌ Continuing to search after you have {x} medications.
 
-MOST COMMON FAILURE: Not verifying RxCUI exists in RRF before returning it.
-ALWAYS call verify_rxcui_in_rrf() and check that exists=true.
+MOST COMMON FAILURE: Not using the exact name/RxCUI from the tool output.
 
 ═══════════════════════════════════════════════════════════════
 🎯 WORKFLOW EXAMPLE (Follow this pattern)
@@ -301,37 +131,31 @@ ALWAYS call verify_rxcui_in_rrf() and check that exists=true.
 
 Example: Generating "amoxicillin 500 MG Oral Capsule"
 
-1. Search: Call search_rrf_medications("amoxicillin 500 MG")
-   → Response contains matches with RxCUIs and names
-   → Select match with TTY=SCD and RxCUI (e.g., "197806")
+1. Search: Call find_rrf_verified_medications("amoxicillin 500 MG")
+   → Response contains verified matches (e.g., RxCUI 197806, name "amoxicillin 500 MG Oral Capsule")
 
-2. Verify: Call verify_rxcui_in_rrf("197806")
-   → Response: { "exists": true, "preferredName": "amoxicillin 500 MG Oral Capsule", ... }
+2. Use EXACT name: "amoxicillin 500 MG Oral Capsule" and RxCUI "197806".
 
-3. Use EXACT name: "amoxicillin 500 MG Oral Capsule" (from preferredName)
-
-4. Return: { "name": "amoxicillin 500 MG Oral Capsule", "rxcui": "197806" }
+3. Return: { "name": "amoxicillin 500 MG Oral Capsule", "rxcui": "197806" }
 
 ═══════════════════════════════════════════════════════════════
 💡 STRATEGY FOR HIGH SUCCESS RATE
 ═══════════════════════════════════════════════════════════════
 
-1. Use well-known, common medications across diverse categories
-2. ALWAYS call search_rrf_medications() first to find the correct name and RxCUI
-3. ALWAYS call verify_rxcui_in_rrf() to confirm the RxCUI exists in RRF
-4. Use the EXACT name from preferredName in verification response - never create your own
-5. Prefer medications with TTY: SCD, SBD, SCDC, or SBDC
-6. If verification fails (exists=false), skip that medication and try another
-7. Generate diverse medications: oral, injectable, topical, inhalation, etc.
+1. Use well-known, common medications across diverse categories.
+2. Use find_rrf_verified_medications() to fetch batches of viable options.
+3. Copy the exact \`name\` + \`rxcui\` from a verified entry—never rewrite it.
+4. Prefer TTY SCD/SBD/SCDC/SBDC (BN for brands when applicable).
+5. Keep categories and routes diverse (unless the condition dictates otherwise).
+6. Stop searching once you have {x} high-quality medications.
 
 ═══════════════════════════════════════════════════════════════
 
 🔴 FINAL REMINDER:
-- You MUST verify each medication using the functions before including it
-- If exists=false in verification, skip that medication and try another
-- Use ONLY the exact name from preferredName in verification response
-- Generate exactly {x} unique medications - you have enough iterations to complete this
-- Work efficiently: one search can yield multiple valid medications to verify
+- Use find_rrf_verified_medications() to gather all data (name + RxCUI). No other verification step is needed.
+- Only include entries marked verified=true and copy their names exactly.
+- Generate exactly {x} unique medications—stop searching when you reach that number.
+- Work efficiently: reuse matches from a single search before calling the tool again.
 
 Generate {x} unique, verified medications now. Work systematically through the categories.`;
 
@@ -508,17 +332,15 @@ Examples for "${condition.trim()}":
 - Search for medications commonly prescribed or recommended for this condition
 - Include first-line treatments and alternatives
 - Consider different strengths and formulations as appropriate
-- Verify each medication exists in RRF before including it
-
 `
         : `\n═══════════════════════════════════════════════════════════════
 ✅ MEDICATION SELECTION GUIDELINES
 ═══════════════════════════════════════════════════════════════
 
-Generate diverse medications across these categories. For EACH one, you MUST:
-1. Call search_rrf_medications() to find it
-2. Call verify_rxcui_in_rrf() to confirm it exists
-3. Use the exact name from the verification response
+Generate diverse medications across these categories. For EACH one:
+1. Call find_rrf_verified_medications() with a relevant search term.
+2. Review the returned matches and pick entries marked verified=true.
+3. Use the exact RxNorm name provided in the match.
 
 Categories to include:
 - Common prescription drugs (antibiotics, statins, ACE inhibitors, etc.)
@@ -532,15 +354,15 @@ Categories to include:
 `;
 
       // Generate prompt with the count and condition
-      let prompt = PROMPT_TEMPLATE
+      const prompt = PROMPT_TEMPLATE
         .replace(/{x}/g, num.toString())
         .replace(/{condition_context}/g, conditionContext)
         .replace(/{condition_instructions}/g, conditionInstructions)
         .replace(/{medication_selection_instructions}/g, condition.trim() 
           ? `Generate medications specifically appropriate for treating "${condition.trim()}". For EACH one, you MUST:
-1. Call search_rrf_medications() to find medications relevant to this condition
-2. Call verify_rxcui_in_rrf() to confirm it exists
-3. Use the exact name from the verification response
+1. Call find_rrf_verified_medications() with condition-relevant search terms.
+2. Select entries marked verified=true that match the clinical need.
+3. Use the exact RxNorm name returned by the function.
 
 Focus on medications that are:
 - Clinically indicated for ${condition.trim()}
@@ -548,9 +370,9 @@ Focus on medications that are:
 - Available in appropriate formulations (oral, topical, injectable, etc.)
 - Include both prescription and OTC options as appropriate`
           : `Generate diverse medications across these categories. For EACH one, you MUST:
-1. Call search_rrf_medications() to find it
-2. Call verify_rxcui_in_rrf() to confirm it exists
-3. Use the exact name from the verification response
+1. Call find_rrf_verified_medications() to fetch candidates.
+2. Choose entries marked verified=true across different categories.
+3. Use the exact RxNorm name returned by the function.
 
 Categories to include:
 - Common prescription drugs (antibiotics, statins, ACE inhibitors, etc.)
